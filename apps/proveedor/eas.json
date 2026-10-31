@@ -7,7 +7,6 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
-      "channel": "development",
       "env": {
         "EXPO_PUBLIC_API_URL": "http://10.0.2.2:4000/v1",
         "EXPO_PUBLIC_WS_URL": "http://10.0.2.2:4000",
@@ -16,7 +15,6 @@
     },
     "staging": {
       "distribution": "internal",
-      "channel": "staging",
       "env": {
         "EXPO_PUBLIC_API_URL": "https://staging-api.chapus.es/v1",
         "EXPO_PUBLIC_WS_URL": "https://staging-api.chapus.es",
@@ -25,7 +23,6 @@
     },
     "production": {
       "autoIncrement": true,
-      "channel": "production",
       "env": {
         "EXPO_PUBLIC_API_URL": "https://api.chapus.es/v1",
         "EXPO_PUBLIC_WS_URL": "https://api.chapus.es"
