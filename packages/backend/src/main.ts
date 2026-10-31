@@ -1,5 +1,5 @@
 import http from 'http';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomInt } from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import { Server as SocketServer } from 'socket.io';
 import { Pool } from 'pg';
@@ -32,6 +32,10 @@ function requireJwtSecret(): string {
 const JWT_SECRET = requireJwtSecret();
 
 const PORT = Number(process.env.PORT || 4000);
+
+// Bandera estricta de entorno: solo permite atajos de auditoría fuera de producción
+const IS_STAGING_OR_DEV =
+  process.env.NODE_ENV === 'staging' || process.env.NODE_ENV === 'development';
 
 interface JwtClaims {
   sub: string;
@@ -241,7 +245,7 @@ async function bootstrap() {
   const handleOtpSend = async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { phone } = req.body || {};
-      if (!phone) {
+      if (!phone || typeof phone !== 'string') {
         return res.status(400).json({
           statusCode: 400,
           errorCode: 'INVALID_PHONE',
@@ -249,11 +253,14 @@ async function bootstrap() {
           timestamp: new Date().toISOString(),
         });
       }
-      // En staging generamos OTP determinista 123456 (o aleatorio guardado en Redis 5 min)
-      const otpCode = process.env.STAGE_FIXED_OTP || '123456';
+      // En producción: 6 dígitos criptográficos aleatorios.
+      // En staging/dev: permite variable STAGE_FIXED_OTP o '123456' para pruebas E2E.
+      const otpCode = IS_STAGING_OR_DEV
+        ? process.env.STAGE_FIXED_OTP || '123456'
+        : String(randomInt(100000, 1000000));
       await redis.set(`otp:${phone}`, otpCode, 'EX', 300);
 
-      logger.info({ phone }, '[Auth] OTP generado en Staging');
+      logger.info({ phone, env: process.env.NODE_ENV }, '[Auth] OTP generado y almacenado en Redis');
       return res.status(200).json({
         retryAfterSeconds: 60,
         expiresAt: new Date(Date.now() + 300_000).toISOString(),
@@ -279,8 +286,12 @@ async function bootstrap() {
       }
 
       const storedOtp = await redis.get(`otp:${phone}`);
-      // En staging aceptamos el código guardado en Redis o '123456' para pruebas automatizadas
-      if (storedOtp !== code && code !== '123456') {
+
+      // BLOQUEO DE SEGURIDAD: El bypass '123456' SOLO se evalúa si IS_STAGING_OR_DEV es true
+      const isValidOtp =
+        (storedOtp !== null && storedOtp === code) || (IS_STAGING_OR_DEV && code === '123456');
+
+      if (!isValidOtp) {
         return res.status(401).json({
           statusCode: 401,
           errorCode: 'INVALID_OTP',
@@ -290,9 +301,13 @@ async function bootstrap() {
       }
       await redis.del(`otp:${phone}`);
 
-      // En staging, los proveedores que verifican OTP nacen con kyc_status = 'VERIFIED'
-      // (a menos que el teléfono termine en '0000', reservado para probar el bloqueo HTTP 403)
-      const initialKycStatus = phone.endsWith('0000') ? 'PENDING_VERIFICATION' : 'VERIFIED';
+      // En PRODUCCIÓN todo usuario nuevo nace siempre como 'UNVERIFIED'.
+      // Solo en STAGING/DEV se auto-verifica para la prueba de latencia (salvo sufijo '0000').
+      const initialKycStatus = IS_STAGING_OR_DEV
+        ? phone.endsWith('0000')
+          ? 'PENDING_VERIFICATION'
+          : 'VERIFIED'
+        : 'UNVERIFIED';
 
       const upsertRes = await db.query(
         `INSERT INTO users (phone, full_name, role, kyc_status, fcm_token, is_online)
@@ -310,8 +325,8 @@ async function bootstrap() {
       );
 
       const user = upsertRes.rows[0];
-      // Suscribir automáticamente al proveedor a todas las categorías en staging
-      if (user.activeRole === 'PROVIDER' || user.activeRole === 'DUAL') {
+      // Auto-suscripción a categorías solo en Staging/Dev para agilizar la prueba de radio
+      if (IS_STAGING_OR_DEV && (user.activeRole === 'PROVIDER' || user.activeRole === 'DUAL')) {
         await db.query(
           `INSERT INTO provider_services (provider_id, category_id)
            SELECT $1, id FROM service_categories
