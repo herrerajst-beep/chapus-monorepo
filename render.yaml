@@ -1,0 +1,56 @@
+# render.yaml (Raíz del monorepo)
+services:
+  # 1. API Backend + Servidor WebSocket (Socket.IO v4)
+  - type: web
+    name: chapus-api-staging
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    region: frankfurt
+    plan: standard
+    healthCheckPath: /v1/health
+    numInstances: 1
+    envVars:
+      - key: NODE_ENV
+        value: staging
+      - key: PORT
+        value: 4000
+      - key: DATABASE_URL
+        fromDatabase:
+          name: chapus-postgis-staging
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: chapus-redis-staging
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STORAGE_BUCKET_NAME
+        value: chapus-staging-eu-south-2
+      - key: STORAGE_CDN_URL
+        value: https://cdn-staging.chapus.es
+
+  # 2. Instancia Redis en Memoria (Locks Atómicos + Socket.IO Adapter)
+  - type: redis
+    name: chapus-redis-staging
+    region: frankfurt
+    plan: starter
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+
+databases:
+  # 3. Base de Datos Relacional y Geoespacial (PostgreSQL 16 + PostGIS)
+  - name: chapus-postgis-staging
+    region: frankfurt
+    plan: basic-1gb
+    postgresMajorVersion: 16
+    databaseName: chapus_core
+    user: chapus_admin
+    ipAllowList: []
