@@ -1,61 +1,42 @@
-# Estado de la integración Frontend ↔ Backend (contrato v1.1.0)
+# Estado de la integración Frontend ↔ Backend
 
-> `CONTRACT_GAPS.md` contiene ahora el parche del dispatcher que envió Argon. Este archivo sustituye a la lista de huecos.
+> `CONTRACT_GAPS.md` contiene el parche del dispatcher que envió Argon. Este archivo recoge el estado vivo.
 
-## ⚠️ El `openapi.yaml.yaml` v1.1.0 llegó truncado
+## Contrato
 
-Termina en la línea 273, a mitad de `ServiceRequestCreate.offeredPriceEur`. Faltan `ServiceRequestResponse`, `BidResponse` y **toda la sección `paths`**.
+`packages/api-contract/openapi.yaml` incluye las líneas 1–273 de la v1.1.0 de Argon (llegó truncada); el resto lo reconstruyó frontend desde el código de backend.
 
-`packages/api-contract/openapi.yaml` se compone de dos partes:
-- **Las líneas 1–273 de Argon, sin cambios** (esquemas estrictos de auth, presign, catálogo, errores…).
-- **El resto, reconstruido por frontend** a partir de `bookings.service.ts`, `realtime.gateway.ts` y `presign.service.ts`. Está marcado en el YAML. Pasa `redocly lint` sin errores.
+`ServiceRequestResponse` es ahora el espejo exacto de `ServiceRequestDTO` (`service-request.serializer.ts`). Sus campos nuevos son `addressText: string | null`, `approximateZone` e `isAddressMasked`.
 
-**Acción:** que Argon envíe el archivo completo. Basta con sustituir `packages/api-contract/openapi.yaml` y ejecutar `npm run gen:api && npm run typecheck`. Cualquier diferencia de forma saldrá como error de tipos.
+**Pendiente:** que Argon envíe el YAML completo. Basta con sustituirlo y ejecutar `npm run gen:api && npm run typecheck`.
 
-Supuestos de la reconstrucción que conviene confirmar:
+Supuestos que hay que confirmar:
+- `POST /auth/refresh`. Hace falta para re-firmar el claim `kycStatus`.
+- Que `POST /requests/{id}/bids` devuelva `BidResponse`.
+- Que `start` y `complete` devuelvan el DTO.
+- La forma de `booking:assigned`: `{ job, guaranteedPayoutEur }`.
 
-| Supuesto | Fuente |
+## ✅ Integrado (v1.1 + privacidad + job:updated)
+
+| Pieza | Frontend |
 |---|---|
-| `ServiceRequestResponse` incluye `bidsCount`, `acceptedAt` y `completedAt` | SELECT de `getRequestById` |
-| `BidResponse.provider = { id, fullName, ratingAvg, completedJobsCount, avatarUrl }` y `status: BidStatus` | SELECT de `getBidsByRequestId` |
-| `POST /auth/otp/request` → 204 | No especificado |
-| **`POST /auth/refresh { refreshToken }` → `AuthSessionResponse`** | No existe en el material recibido. Hace falta porque el JWT caduca y **el claim `kycStatus` debe re-firmarse tras el KYC** para que `/offers` acepte la conexión |
-| `POST /requests/{id}/bids` → 201 `BidResponse` | Antes no había cuerpo |
-| `start` y `complete` → 200 `ServiceRequestResponse` | Antes no había cuerpo |
-| `paymentSheet` es `null` en BIDDING al crear | Descripción de la v1.0.0 |
+| Máscara RGPD en el serializador | La UI usa solo `isAddressMasked`, `addressText` y `approximateZone`. Se eliminó el enmascarado del lado cliente. La ruta (Google Maps, Waze, Mapas de Apple) solo se ofrece con `isAddressMasked: false`. |
+| `job:updated` en `/offers` y `/bookings` | Listener global en el proveedor (`useJobEvents`) y por solicitud en el cliente. Descarta eventos fuera de orden por `version`. |
+| `booking:assigned` | Vibra, guarda `guaranteedPayoutEur` y lleva al profesional a la ficha si está en otra pantalla. |
+| Sin polling | Se eliminó el sondeo de `GET /requests/{id}`. La app solo vuelve a pedir el estado tras reconectar el socket o al volver a primer plano, por si se perdió algún evento. |
+| ACK de telemetría | `{ received: true, deviceId, clientTimestamp }`. `deviceId` es un id de instalación estable guardado en SecureStore. |
+| 403 `RGPD_ACCESS_DENIED` | Un proveedor que perdió la carrera ve «Este trabajo ya no está disponible». |
+| Push sin dirección | Se usa `approximateZone` del `data` del push. |
 
-## ✅ Integrado en el frontend
+## ⚠️ Observaciones para Argon (por prioridad)
 
-- **Login OTP** (SMS/WhatsApp, `+34[6789]xxxxxxxx`). Sesión en SecureStore con renovación proactiva y una sola petición de refresh a la vez. La pantalla de login está tras `Stack.Protected`.
-- **Namespace `/offers`.**
-  - `geo:job_alert { request, distanceKm }` se confirma con `{ received: true, timestamp }`.
-  - `geo:job_taken` retira la alerta.
-  - Un `connect_error` con 403 `KYC_VERIFICATION_REQUIRED` muestra el aviso de verificación.
-  - Al volver de Stripe, la app renueva el JWT y reconecta.
-- **Namespace `/bookings`.**
-  - `request:subscribe` se repite en cada reconexión.
-  - `request:updated` se ordena por `version`, descartando eventos fuera de orden.
-  - `request:bid_created` llega deduplicado.
-- **Presign.** Se pide una URL por archivo con el `fileSizeBytes` exacto del JPEG ya comprimido, porque S3 firma el `ContentLength`. El PUT se envía con `requiredHeaders`.
-- **Consultas.** `GET /requests/{id}` y `GET /requests/{id}/bids` sustituyen la caché local. Se rehidratan al resuscribirse.
+1. **Regresión en el push de respaldo (bloqueante para Fast-Match).** `sendBatchPushFallback` envía solo `data`. Se perdieron:
+   - en Android, `notification` con `channelId: 'chapus_urgent_jobs'`;
+   - en iOS, `apns` con `alert`, `sound` y `apns-priority: 10`.
 
-## Observaciones para Argon
-
-1. **ACK con varios dispositivos** (`emitWithAckTimeout`). En Socket.IO v4, `err` se activa si *algún* socket de la sala no responde a tiempo, aunque `responses` sí contenga el ACK de otro. Con un móvil activo y una tablet zombie, hoy se dispara el push igualmente. Propuesta:
-   ```ts
-   resolve(Array.isArray(responses) && responses.some((a) => a?.received === true));
-   ```
-2. **Autorización (seguridad).**
-   - `request:subscribe` une a cualquier usuario autenticado a cualquier sala `request:{id}`.
-   - `getRequestById` no comprueba la propiedad de la solicitud.
-   
-   Ambos exponen la dirección del domicilio. Hay que verificar `client_id = sub`, o que el usuario sea el proveedor asignado o notificado.
-3. **El proveedor no recibe `request:updated`.** Su pantalla "Trabajo asignado" no se entera en vivo de que el cliente pagó (`AWAITING_PAYMENT → ASSIGNED`). Opciones: permitir que el proveedor asignado se suscriba en `/bookings`, o emitir `job:updated` en la sala `provider:{id}` de `/offers`.
-4. **Sin `categoryName` en el payload de `geo:job_alert`.** El frontend lo resuelve con el catálogo en caché. Es correcto, pero si el catálogo aún no ha cargado, el banner muestra "Trabajo".
-5. **Push de respaldo.** Siguen pendientes el `distanceKm: 'Calculando...'` y la falta de `createdAt` en `data`.
-
-## Peticiones nuevas (sprint de dispositivo físico)
-
-6. **`job:updated` en `/offers`.** Mismo payload que `request:updated`, emitido a la sala `provider:{id}` del adjudicatario, sobre todo al pasar de `AWAITING_PAYMENT` a `ASSIGNED`. El frontend ya lo escucha (`useAssignedJob`). Mientras no exista, la app consulta `GET /requests/{id}` cada 5 s en `AWAITING_PAYMENT`.
-7. **Enmascarar `addressText` y `location` hasta `ASSIGNED`.** Hoy `geo:job_alert` y `/geo/nearby-requests` envían la dirección y las coordenadas exactas a todos los candidatos. La app solo muestra el código postal y la ciudad, pero el dato viaja igualmente.
-8. **Medir la latencia en el servidor.** El ACK ya incluye `timestamp`, la hora del móvil al recibir el evento. Registrar `t_emit` y `ack.timestamp - t_emit`, con su p95 por operador (4G/5G), da la cifra real de extremo a extremo.
+   Sin ellos, iOS no muestra nada con la app cerrada, y Android no despierta la pantalla ni hace sonar `urgent_alert.wav`. **El profesional con el móvil en el bolsillo no se entera.** Basta con recuperar esos bloques con un título genérico (precio y `approximateZone`, nunca la dirección).
+2. **`adapter.rooms` es local al nodo.** Con Redis Adapter en varias instancias, `rooms.get('provider:{id}')` no ve los sockets conectados a otro nodo. Esos proveedores salen como `NO_ACTIVE_SOCKET` y reciben push en lugar de WS, lo que dispara el coste de FCM y la latencia. Opciones: `await offersNamespace.in(room).fetchSockets()`, que funciona en todo el clúster, o emitir siempre y decidir solo por el ACK.
+3. **`toDTO` lanza excepción dentro de `Promise.all` del dispatcher.** Si una oleada se despacha cuando la solicitud ya no está `OPEN`, el primer candidato lanza 403 y aborta la oleada entera, incluido el push. Conviene comprobar el estado antes de despachar.
+4. **Emisor de `booking:assigned`.** No está en el material recibido; el frontend lo escucha con la forma supuesta.
+5. **p95 en `logWaveViabilityMetrics`.** `floor(n * 0.95)` devuelve el máximo cuando n ≤ 20. Para nearest-rank es `ceil(0.95 n) - 1`. Es menor, pero sobrestima el p95 en oleadas pequeñas.
+6. **`job:updated` a `client:{id}`.** El gateway de `/bookings` no une a nadie a esa sala, solo a `request:{id}`. Hoy funciona por la segunda sala; si se quiere la primera, hay que hacer `socket.join(\`client:${sub}\`)` al conectar.

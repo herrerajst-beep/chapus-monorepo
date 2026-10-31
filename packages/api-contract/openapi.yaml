@@ -295,23 +295,43 @@ components:
     # (la v1.1.0 llegó truncada en la línea 273). Sustituir por el original de Argon
     # y ejecutar `npm run gen:api`: el typecheck señalará cualquier diferencia.
     # ---------------------------------------------------------------------------
+    # Espejo de ServiceRequestDTO (service-request.serializer.ts). Toda salida REST y
+    # WebSocket pasa por ServiceRequestSerializer.toDTO(row, viewerUserId).
     ServiceRequestResponse:
-      allOf:
-        - $ref: '#/components/schemas/ServiceRequestCreate'
-        - type: object
-          required: [id, clientId, assignedProviderId, finalAgreedPriceEur, status, bidsCount, version, scheduledAt, createdAt, acceptedAt, completedAt]
-          properties:
-            id: { type: string, format: uuid }
-            clientId: { type: string, format: uuid }
-            assignedProviderId: { type: string, format: uuid, nullable: true }
-            finalAgreedPriceEur: { type: number, format: float, nullable: true }
-            status: { $ref: '#/components/schemas/BookingStatus' }
-            bidsCount: { type: integer }
-            version: { type: integer }
-            scheduledAt: { type: string, format: date-time, nullable: true }
-            createdAt: { type: string, format: date-time }
-            acceptedAt: { type: string, format: date-time, nullable: true }
-            completedAt: { type: string, format: date-time, nullable: true }
+      type: object
+      required: [id, clientId, assignedProviderId, categoryId, pricingModel, offeredPriceEur, finalAgreedPriceEur, location, addressText, approximateZone, isAddressMasked, description, photoUrls, status, bidsCount, version, scheduledAt, createdAt, acceptedAt, completedAt]
+      properties:
+        id: { type: string, format: uuid }
+        clientId: { type: string, format: uuid }
+        assignedProviderId: { type: string, format: uuid, nullable: true }
+        categoryId: { type: integer }
+        pricingModel: { $ref: '#/components/schemas/PricingModel' }
+        offeredPriceEur: { type: number, format: float, nullable: true }
+        finalAgreedPriceEur: { type: number, format: float, nullable: true }
+        location:
+          allOf: [{ $ref: '#/components/schemas/GeoPoint' }]
+          description: Exacta si isAddressMasked es false; truncada a 2 decimales (~1,1 km) si es true
+        addressText:
+          type: string
+          nullable: true
+          description: null mientras isAddressMasked sea true
+        approximateZone:
+          type: string
+          example: "28014 Madrid"
+        isAddressMasked:
+          type: boolean
+          description: false para el cliente propietario y para el proveedor adjudicado desde ASSIGNED
+        description: { type: string }
+        photoUrls:
+          type: array
+          items: { type: string, format: uri }
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        bidsCount: { type: integer }
+        version: { type: integer }
+        scheduledAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        acceptedAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: string, format: date-time, nullable: true }
 
     NearbyRequest:
       allOf:

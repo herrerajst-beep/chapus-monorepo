@@ -9,6 +9,7 @@ import {
   type OffersServerEvents,
 } from '@chapus/core';
 import { offersSocket } from '@/lib/api';
+import { getDeviceId } from '@/lib/device';
 import { useLatency } from '@/features/diagnostics/latency';
 import { useAlerts } from './store';
 
@@ -16,6 +17,7 @@ const fromPush = (data: JobAlertPushData) => ({
   requestId: data.requestId,
   pricingModel: data.pricingModel,
   offeredPriceEur: data.offeredPriceEur ? Number(data.offeredPriceEur) : undefined,
+  approximateZone: data.approximateZone,
   receivedAt: Date.now(),
   source: 'push' as const,
 });
@@ -31,7 +33,7 @@ export const handleJobAlert = (
   source: 'ws' | 'simulated' = 'ws',
 ) => {
   const t0 = performance.now();
-  ack({ received: true, timestamp: Date.now() });
+  ack({ received: true, deviceId: getDeviceId(), clientTimestamp: Date.now() });
   const ackMs = performance.now() - t0;
   useAlerts.getState().receive({
     requestId: request.id,

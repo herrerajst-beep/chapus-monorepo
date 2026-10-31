@@ -1,4 +1,4 @@
-import type { Bid, KycStatus, PricingModel, ServiceRequest } from './domain';
+import type { Bid, BookingStatus, KycStatus, PricingModel, ServiceRequest } from './domain';
 
 /** Ventana durante la que un FAST_MATCH es aceptable (alineado con el TTL de push del dispatcher). */
 export const FAST_MATCH_ALERT_TTL_MS = 45_000;
@@ -14,11 +14,15 @@ export interface JobAlertPayload {
   distanceKm: number;
 }
 
-/** El dispatcher acepta la entrega si algún dispositivo responde `received: true`. */
+/**
+ * Respuesta al callback del emit (`DeviceAckPayload` del dispatcher). Basta con que un
+ * dispositivo del proveedor responda `received: true`; el Δt emit→ACK lo mide el servidor
+ * con hrtime y lo registra como métrica `ws_dispatch_ack`.
+ */
 export interface JobAlertAck {
   received: true;
-  /** Hora del móvil al recibir: permite al backend medir la latencia emit→ACK. */
-  timestamp: number;
+  deviceId: string;
+  clientTimestamp: number;
 }
 
 export interface JobTakenPayload {
@@ -26,25 +30,38 @@ export interface JobTakenPayload {
   takenAt: string;
 }
 
+/**
+ * `job:updated` (JobStateBroadcaster): un DTO serializado para cada destinatario.
+ * El cliente propietario siempre lo recibe sin máscara; el proveedor vinculado, con
+ * `addressText: null` hasta ASSIGNED.
+ */
+export interface JobUpdatedPayload {
+  job: ServiceRequest;
+  previousStatus: BookingStatus;
+  currentStatus: BookingStatus;
+  transitionedAt: string;
+}
+
+/**
+ * `booking:assigned`: Stripe confirmó la retención del Escrow. El job llega con la
+ * dirección exacta. FORMA SUPUESTA: el material recibido describe el evento pero no su
+ * emisor; confirmar con Argon.
+ */
+export interface BookingAssignedPayload {
+  job: ServiceRequest;
+  guaranteedPayoutEur: number;
+}
+
 export interface OffersServerEvents {
   'geo:job_alert': (payload: JobAlertPayload, ack: (res: JobAlertAck) => void) => void;
   'geo:job_taken': (payload: JobTakenPayload) => void;
-  /**
-   * PROPUESTA para Argon (aún no implementado): cambios del trabajo adjudicado emitidos a
-   * la sala `provider:{id}`, sobre todo AWAITING_PAYMENT → ASSIGNED al confirmarse el pago.
-   * Misma forma que `request:updated`. Mientras no exista, el frontend sondea por REST.
-   */
-  'job:updated': (payload: RequestUpdatedPayload) => void;
+  'job:updated': (payload: JobUpdatedPayload) => void;
+  'booking:assigned': (payload: BookingAssignedPayload) => void;
 }
 
 // ---------------------------------------------------------------------------
 // /bookings: clientes siguiendo sus solicitudes (sala `request:{id}`)
 // ---------------------------------------------------------------------------
-
-export interface RequestUpdatedPayload {
-  request: ServiceRequest;
-  updatedAt: string;
-}
 
 export interface BidCreatedPayload {
   requestId: string;
@@ -52,7 +69,7 @@ export interface BidCreatedPayload {
 }
 
 export interface BookingsServerEvents {
-  'request:updated': (payload: RequestUpdatedPayload) => void;
+  'job:updated': (payload: JobUpdatedPayload) => void;
   'request:bid_created': (payload: BidCreatedPayload) => void;
 }
 
@@ -83,8 +100,10 @@ export interface JobAlertPushData {
   type: 'NEW_JOB_ALERT';
   requestId: string;
   pricingModel: PricingModel;
-  offeredPriceEur: string;
-  distanceKm: string;
+  /** La dirección exacta nunca viaja por FCM/APNs. */
+  approximateZone?: string;
+  /** Solo en versiones anteriores del dispatcher. */
+  offeredPriceEur?: string;
 }
 
 export function isJobAlertPushData(data: unknown): data is JobAlertPushData {

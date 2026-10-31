@@ -3,7 +3,7 @@ import { Pressable, StyleSheet, View } from 'react-native';
 import { router, usePathname } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { isApiError, useCategories, useFastAccept } from '@chapus/api';
-import { FAST_MATCH_ALERT_TTL_MS, approximateZone, formatDistance, formatEur } from '@chapus/core';
+import { FAST_MATCH_ALERT_TTL_MS, formatDistance, formatEur } from '@chapus/core';
 import { Button, Text, palette, radius, space } from '@chapus/ui';
 import { useLatency } from '@/features/diagnostics/latency';
 import { useAlerts, type JobAlert } from './store';
@@ -73,7 +73,9 @@ export function FastMatchBanner() {
           {alert.request ? <Text muted>{formatDistance(alert.request.distanceKm)}</Text> : null}
         </View>
         <Text numberOfLines={1} muted>
-          {alert.request ? `${categoryName(alert.request.categoryId)} · ${approximateZone(alert.request.addressText)}` : 'Toca para ver los detalles'}
+          {alert.request
+            ? `${categoryName(alert.request.categoryId)} · ${alert.request.approximateZone}`
+            : (alert.approximateZone ?? 'Toca para ver los detalles')}
         </Text>
       </Pressable>
       {notice ? <Text style={{ color: palette.danger }}>{notice}</Text> : null}

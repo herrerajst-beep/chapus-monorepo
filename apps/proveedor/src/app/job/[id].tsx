@@ -1,20 +1,13 @@
 import { ActivityIndicator, Linking, Platform, View } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
 import { useCategories, useJobLifecycle } from '@chapus/api';
-import {
-  STATUS_LABEL,
-  approximateZone,
-  displayPrice,
-  formatEur,
-  isAddressRevealed,
-  navigationLinks,
-} from '@chapus/core';
+import { STATUS_LABEL, displayPrice, formatEur, navigationLinks } from '@chapus/core';
 import { Badge, Button, Card, Screen, Text, palette, space } from '@chapus/ui';
 import { useAssignedJob } from '@/features/jobs/useAssignedJob';
 
 export default function JobScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const { data: job, isError, refetch } = useAssignedJob(id);
+  const { data: job, isError, refetch, guaranteedPayoutEur } = useAssignedJob(id);
   const categories = useCategories();
   const { start } = useJobLifecycle(id);
 
@@ -29,7 +22,8 @@ export default function JobScreen() {
   if (!job) return <Screen><Text muted>Cargando trabajo…</Text></Screen>;
 
   const price = displayPrice(job);
-  const revealed = isAddressRevealed(job.status);
+  // El servidor decide la máscara (ServiceRequestSerializer): sin dirección no hay ruta.
+  const revealed = !job.isAddressMasked && job.addressText !== null;
   const links = navigationLinks(job.location);
   const category = categories.data?.find((c) => c.id === job.categoryId)?.name;
 
@@ -49,7 +43,7 @@ export default function JobScreen() {
             <View style={{ flex: 1, gap: space.xs }}>
               <Text variant="heading">Esperando la confirmación del pago</Text>
               <Text variant="caption" muted>
-                Zona: {approximateZone(job.addressText)}. Verás la dirección exacta y la ruta en cuanto el
+                Zona: {job.approximateZone}. Verás la dirección exacta y la ruta en cuanto el
                 cliente pague. El importe queda protegido por Stripe.
               </Text>
             </View>
@@ -60,6 +54,9 @@ export default function JobScreen() {
       {revealed ? (
         <Card style={{ borderColor: palette.provider, borderWidth: 1.5 }}>
           {job.status === 'ASSIGNED' ? <Badge tone="provider" label="✓ Pago confirmado" /> : null}
+          {guaranteedPayoutEur !== null ? (
+            <Text>Cobro garantizado: <Text variant="heading">{formatEur(guaranteedPayoutEur)}</Text></Text>
+          ) : null}
           <Text variant="caption" muted>Dirección del cliente</Text>
           <Text variant="heading" selectable>{job.addressText}</Text>
           <View style={{ flexDirection: 'row', gap: space.sm }}>

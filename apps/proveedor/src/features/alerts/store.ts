@@ -9,6 +9,8 @@ export interface JobAlert {
   requestId: string;
   pricingModel: PricingModel;
   offeredPriceEur?: number | null;
+  /** Del push de respaldo: única referencia de ubicación hasta tener el DTO. */
+  approximateZone?: string;
   receivedAt: number;
   source: 'ws' | 'push';
   request?: NearbyRequest;

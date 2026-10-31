@@ -10,9 +10,12 @@ import { setupNotificationChannels } from '@/features/alerts/notifications';
 import { useJobAlertChannel } from '@/features/alerts/useJobAlertChannel';
 import { FastMatchBanner } from '@/features/alerts/FastMatchBanner';
 import { usePresenceTracking } from '@/features/presence/usePresence';
+import { useJobEvents } from '@/features/jobs/useJobEvents';
+import { loadDeviceId } from '@/lib/device';
 
 function Realtime() {
   useJobAlertChannel();
+  useJobEvents();
   usePresenceTracking();
   return <FastMatchBanner />;
 }
@@ -22,6 +25,7 @@ export default function RootLayout() {
 
   useEffect(() => {
     void session.hydrate();
+    void loadDeviceId();
     void setupNotificationChannels();
   }, []);
 

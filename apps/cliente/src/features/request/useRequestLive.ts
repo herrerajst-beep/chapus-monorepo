@@ -23,7 +23,8 @@ export function useRequestLive(requestId: string) {
       });
     };
 
-    const onUpdated: BookingsServerEvents['request:updated'] = ({ request: r }) => {
+    // job:updated llega con el DTO del propietario (dirección siempre visible).
+    const onUpdated: BookingsServerEvents['job:updated'] = ({ job: r }) => {
       if (r.id !== requestId) return;
       // Descarta eventos fuera de orden: `version` crece con cada cambio de estado.
       qc.setQueryData(queryKeys.request(requestId), (prev: typeof r | undefined) =>
@@ -38,14 +39,14 @@ export function useRequestLive(requestId: string) {
     };
 
     bookingsSocket.on('connect', subscribe);
-    bookingsSocket.on('request:updated', onUpdated);
+    bookingsSocket.on('job:updated', onUpdated);
     bookingsSocket.on('request:bid_created', onBid);
     if (bookingsSocket.connected) subscribe();
     else bookingsSocket.connect();
 
     return () => {
       bookingsSocket.off('connect', subscribe);
-      bookingsSocket.off('request:updated', onUpdated);
+      bookingsSocket.off('job:updated', onUpdated);
       bookingsSocket.off('request:bid_created', onBid);
     };
   }, [qc, requestId]);

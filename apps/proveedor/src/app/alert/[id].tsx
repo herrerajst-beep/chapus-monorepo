@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Image, ScrollView, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import { isApiError, useCreateBid, useFastAccept, useMe } from '@chapus/api';
-import { approximateZone, bidSchema, fieldErrors, formatDistance, isAlertExpired } from '@chapus/core';
+import { bidSchema, fieldErrors, formatDistance, isAlertExpired } from '@chapus/core';
 import { Badge, Button, Card, Field, Price, Screen, Text, palette, space } from '@chapus/ui';
 import { useAlerts } from '@/features/alerts/store';
 import { useAlertRequest } from '@/features/alerts/useAlertRequest';
@@ -54,7 +54,7 @@ export default function AlertScreen() {
         </View>
         {isFast && request.offeredPriceEur ? <Price tone="provider" amount={request.offeredPriceEur} /> : null}
         <Text>{request.description}</Text>
-        <Text variant="caption" muted>Zona: {approximateZone(request.addressText)} · dirección exacta al confirmarse el pago</Text>
+        <Text variant="caption" muted>Zona: {request.approximateZone} · dirección exacta al confirmarse el pago</Text>
         <Text variant="caption" muted>
           {request.scheduledAt ? `Programado: ${new Date(request.scheduledAt).toLocaleString('es-ES')}` : 'Urgente: lo antes posible'}
         </Text>

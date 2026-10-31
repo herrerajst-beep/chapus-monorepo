@@ -819,15 +819,29 @@ export interface components {
              */
             scheduledAt?: string | null;
         };
-        ServiceRequestResponse: components["schemas"]["ServiceRequestCreate"] & {
+        ServiceRequestResponse: {
             /** Format: uuid */
             id: string;
             /** Format: uuid */
             clientId: string;
             /** Format: uuid */
             assignedProviderId: string | null;
+            categoryId: number;
+            pricingModel: components["schemas"]["PricingModel"];
+            /** Format: float */
+            offeredPriceEur: number | null;
             /** Format: float */
             finalAgreedPriceEur: number | null;
+            /** @description Exacta si isAddressMasked es false; truncada a 2 decimales (~1,1 km) si es true */
+            location: components["schemas"]["GeoPoint"];
+            /** @description null mientras isAddressMasked sea true */
+            addressText: string | null;
+            /** @example 28014 Madrid */
+            approximateZone: string;
+            /** @description false para el cliente propietario y para el proveedor adjudicado desde ASSIGNED */
+            isAddressMasked: boolean;
+            description: string;
+            photoUrls: string[];
             status: components["schemas"]["BookingStatus"];
             bidsCount: number;
             version: number;

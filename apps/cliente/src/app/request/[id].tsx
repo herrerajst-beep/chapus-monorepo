@@ -37,7 +37,7 @@ export default function RequestScreen() {
         <Badge tone="brand" label={STATUS_LABEL[request.status]} />
         {price !== null ? <Text variant="title">{formatEur(price)}</Text> : null}
         <Text>{request.description}</Text>
-        <Text variant="caption" muted>{request.addressText}</Text>
+        <Text variant="caption" muted>{request.addressText ?? request.approximateZone}</Text>
       </Card>
 
       {request.status === 'OPEN' && request.pricingModel === 'FAST_MATCH' ? (
