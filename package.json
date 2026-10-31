@@ -1,11 +1,15 @@
 {
   "name": "chapus",
   "private": true,
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "gen:api": "npm run gen -w @chapus/api-contract",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "cliente": "npm run start -w @chapus/cliente",
-    "proveedor": "npm run start -w @chapus/proveedor"
+    "proveedor": "npm run start -w @chapus/proveedor",
+    "test": "npm run test --workspaces --if-present"
   }
 }

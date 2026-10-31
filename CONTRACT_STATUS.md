@@ -53,3 +53,9 @@ Supuestos de la reconstrucción que conviene confirmar:
 3. **El proveedor no recibe `request:updated`.** Su pantalla "Trabajo asignado" no se entera en vivo de que el cliente pagó (`AWAITING_PAYMENT → ASSIGNED`). Opciones: permitir que el proveedor asignado se suscriba en `/bookings`, o emitir `job:updated` en la sala `provider:{id}` de `/offers`.
 4. **Sin `categoryName` en el payload de `geo:job_alert`.** El frontend lo resuelve con el catálogo en caché. Es correcto, pero si el catálogo aún no ha cargado, el banner muestra "Trabajo".
 5. **Push de respaldo.** Siguen pendientes el `distanceKm: 'Calculando...'` y la falta de `createdAt` en `data`.
+
+## Peticiones nuevas (sprint de dispositivo físico)
+
+6. **`job:updated` en `/offers`.** Mismo payload que `request:updated`, emitido a la sala `provider:{id}` del adjudicatario, sobre todo al pasar de `AWAITING_PAYMENT` a `ASSIGNED`. El frontend ya lo escucha (`useAssignedJob`). Mientras no exista, la app consulta `GET /requests/{id}` cada 5 s en `AWAITING_PAYMENT`.
+7. **Enmascarar `addressText` y `location` hasta `ASSIGNED`.** Hoy `geo:job_alert` y `/geo/nearby-requests` envían la dirección y las coordenadas exactas a todos los candidatos. La app solo muestra el código postal y la ciudad, pero el dato viaja igualmente.
+8. **Medir la latencia en el servidor.** El ACK ya incluye `timestamp`, la hora del móvil al recibir el evento. Registrar `t_emit` y `ack.timestamp - t_emit`, con su p95 por operador (4G/5G), da la cifra real de extremo a extremo.

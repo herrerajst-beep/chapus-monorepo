@@ -3,7 +3,8 @@ import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { ApiProvider } from '@chapus/api';
-import { palette } from '@chapus/ui';
+import { PermissionPrimerHost, palette } from '@chapus/ui';
+import { DIAGNOSTICS_ENABLED } from '@/features/diagnostics/latency';
 import { api, queryClient, session, useSession } from '@/lib/api';
 import { setupNotificationChannels } from '@/features/alerts/notifications';
 import { useJobAlertChannel } from '@/features/alerts/useJobAlertChannel';
@@ -42,12 +43,16 @@ export default function RootLayout() {
             <Stack.Screen name="alert/[id]" options={{ title: 'Nuevo trabajo', presentation: 'modal' }} />
             <Stack.Screen name="job/[id]" options={{ title: 'Trabajo asignado' }} />
             <Stack.Screen name="kyc" options={{ title: 'Verificación de identidad' }} />
+            <Stack.Protected guard={DIAGNOSTICS_ENABLED}>
+              <Stack.Screen name="diagnostics" options={{ title: 'Diagnóstico' }} />
+            </Stack.Protected>
           </Stack.Protected>
           <Stack.Protected guard={!signedIn}>
             <Stack.Screen name="login" options={{ headerShown: false }} />
           </Stack.Protected>
         </Stack>
         {signedIn ? <Realtime /> : null}
+        <PermissionPrimerHost />
       </ApiProvider>
     </QueryClientProvider>
   );

@@ -4,6 +4,12 @@ import { create } from 'zustand';
 import { socketErrorData, type GeoPoint } from '@chapus/core';
 import { api, offersSocket, session } from '@/lib/api';
 import { getNativePushToken } from '@/features/alerts/notifications';
+import {
+  ensureBackgroundLocation,
+  ensureForegroundLocation,
+  ensureNotifications,
+} from '@/features/permissions/primers';
+import { startBackgroundLocation, stopBackgroundLocation } from './backgroundLocation';
 
 const HEARTBEAT_MS = 30_000;
 const MIN_MOVE_METERS = 75;
@@ -16,6 +22,10 @@ interface PresenceState {
   streaming: boolean;
   position: GeoPoint | null;
   error: PresenceError;
+  /** Rechazó las notificaciones: no recibirá trabajos con la app cerrada. */
+  notificationsOff: boolean;
+  /** Seguimiento de ubicación en segundo plano activo (servicio en primer plano en Android). */
+  background: boolean;
 }
 
 export const usePresenceStore = create<PresenceState>(() => ({
@@ -23,6 +33,8 @@ export const usePresenceStore = create<PresenceState>(() => ({
   streaming: false,
   position: null,
   error: null,
+  notificationsOff: false,
+  background: false,
 }));
 
 let fcmToken: string | undefined;
@@ -54,22 +66,38 @@ offersSocket.on('connect_error', async (err) => {
   }
 });
 
+/** Disparado por el interruptor "Disponible": es el contexto que justifica los permisos. */
 export async function goOnline() {
-  const perm = await Location.requestForegroundPermissionsAsync();
-  if (!perm.granted) return usePresenceStore.setState({ error: 'LOCATION_DENIED' });
+  if (!(await ensureForegroundLocation())) return usePresenceStore.setState({ error: 'LOCATION_DENIED' });
+  // Sin avisos se puede trabajar con la app abierta; se avisa en el radar, no se bloquea.
+  const notifications = await ensureNotifications();
   fcmToken = (await getNativePushToken()) ?? undefined;
   const { coords } = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
   const at = { lat: coords.latitude, lng: coords.longitude };
-  usePresenceStore.setState({ position: at, online: true, error: null });
+  usePresenceStore.setState({ position: at, online: true, error: null, notificationsOff: !notifications });
   offersSocket.connect();
   await beat(at, true);
 }
 
 export async function goOffline() {
   const { position } = usePresenceStore.getState();
-  usePresenceStore.setState({ online: false });
+  usePresenceStore.setState({ online: false, background: false });
   offersSocket.disconnect();
+  await stopBackgroundLocation().catch(() => undefined);
   if (position) await beat(position, false);
+}
+
+/** Opt-in desde el radar. Devuelve false si el usuario no concede "Siempre". */
+export async function enableBackground() {
+  if (!(await ensureBackgroundLocation())) return false;
+  await startBackgroundLocation();
+  usePresenceStore.setState({ background: true });
+  return true;
+}
+
+export async function disableBackground() {
+  await stopBackgroundLocation();
+  usePresenceStore.setState({ background: false });
 }
 
 /**

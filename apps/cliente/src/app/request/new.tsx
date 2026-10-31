@@ -15,6 +15,7 @@ import {
 import { Button, Card, Field, Price, Screen, Segmented, Text, palette, radius, space } from '@chapus/ui';
 import { uploadPhotos, type LocalPhoto } from '@/lib/uploads';
 import { payWithSheet } from '@/lib/payments';
+import { ensureCamera, ensureLocation } from '@/lib/permissions';
 
 const MAX_PHOTOS = 6;
 
@@ -31,16 +32,16 @@ export default function NewRequestScreen() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [step, setStep] = useState<'idle' | 'uploading' | 'creating' | 'paying'>('idle');
   const [checkout, setCheckout] = useState<CheckoutResponse | null>(null);
+  const [locating, setLocating] = useState(false);
 
   useEffect(() => {
     if (category && !category.allowedModels.includes('FAST_MATCH')) setModel('BIDDING');
   }, [category]);
 
-  // Ubicación + dirección sugerida (el usuario puede corregir piso/puerta).
-  useEffect(() => {
-    (async () => {
-      const perm = await Location.requestForegroundPermissionsAsync();
-      if (!perm.granted) return setErrors((e) => ({ ...e, location: 'Activa la ubicación para encontrar profesionales cerca.' }));
+  // Posición + dirección sugerida (el usuario puede corregir piso/puerta).
+  const fillFromGps = async () => {
+    setLocating(true);
+    try {
       const { coords } = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
       setLocation({ lat: coords.latitude, lng: coords.longitude });
       const [place] = await Location.reverseGeocodeAsync(coords);
@@ -48,12 +49,37 @@ export default function NewRequestScreen() {
         const line = [place.street, place.streetNumber].filter(Boolean).join(' ');
         setAddress((a) => a || [line, place.postalCode, place.city].filter(Boolean).join(', '));
       }
-    })().catch(() => setErrors((e) => ({ ...e, location: 'No pudimos obtener tu ubicación.' })));
+    } catch {
+      setErrors((e) => ({ ...e, location: 'No pudimos obtener tu ubicación. Escribe la dirección.' }));
+    } finally {
+      setLocating(false);
+    }
+  };
+
+  // Sin diálogo en la carga: solo se usa el GPS en silencio si el permiso ya estaba concedido.
+  useEffect(() => {
+    Location.getForegroundPermissionsAsync()
+      .then((p) => {
+        if (p.granted) void fillFromGps();
+      })
+      .catch(() => undefined);
   }, []);
+
+  const locateMe = async () => {
+    if (await ensureLocation()) await fillFromGps();
+  };
+
+  /** Alternativa sin permiso de ubicación: geocodificar la dirección escrita. */
+  const resolveLocation = async (): Promise<GeoPoint | null> => {
+    if (location) return location;
+    const [hit] = await Location.geocodeAsync(address).catch(() => []);
+    return hit ? { lat: hit.latitude, lng: hit.longitude } : null;
+  };
 
   if (!category) return <Screen><Text muted>Cargando…</Text></Screen>;
 
   const pickPhotos = async (source: 'camera' | 'library') => {
+    if (source === 'camera' && !(await ensureCamera())) return;
     const options: ImagePicker.ImagePickerOptions = {
       mediaTypes: 'images',
       quality: 0.8,
@@ -69,21 +95,22 @@ export default function NewRequestScreen() {
   };
 
   const submit = async () => {
+    const point = await resolveLocation();
     const draft = {
       categoryId: category.id,
       pricingModel: model,
       offeredPriceEur: model === 'FAST_MATCH' ? category.baseFixedPriceEur : null,
-      location: location ?? { lat: NaN, lng: NaN },
+      location: point ?? { lat: NaN, lng: NaN },
       addressText: address,
       description,
       photoUrls: [] as string[], // se rellenan tras subir las fotos
       scheduledAt: null,
     };
     const check = serviceRequestSchema.safeParse(draft);
-    if (!check.success || !location) {
+    if (!check.success || !point) {
       return setErrors({
         ...(check.success ? {} : fieldErrors(check.error)),
-        ...(location ? {} : { location: 'Necesitamos tu ubicación.' }),
+        ...(point ? {} : { location: 'No encontramos esa dirección. Revísala o pulsa «Usar mi ubicación».' }),
       });
     }
     setErrors({});
@@ -144,7 +171,13 @@ export default function NewRequestScreen() {
 
       <Field label="¿Qué ocurre?" multiline numberOfLines={4} value={description} onChangeText={setDescription}
         placeholder="Ej.: fuga de agua en el sifón del fregadero" error={errors.description} style={{ minHeight: 96, textAlignVertical: 'top' }} />
-      <Field label="Dirección (con piso y puerta)" value={address} onChangeText={setAddress} error={errors.addressText ?? errors.location} />
+      <Field label="Dirección (con piso y puerta)" value={address} onChangeText={(v) => { setAddress(v); if (location) setLocation(null); }}
+        error={errors.addressText ?? errors.location} placeholder="Calle, número, piso, código postal" />
+      {!location ? (
+        <Button variant="outline" label={locating ? 'Localizando…' : '📍 Usar mi ubicación'} loading={locating} onPress={() => void locateMe()} />
+      ) : (
+        <Text variant="caption" muted>📍 Ubicación detectada. Comprueba el piso y la puerta.</Text>
+      )}
 
       <View style={{ gap: space.sm }}>
         <Text variant="caption" muted>Fotos del problema ({photos.length}/{MAX_PHOTOS})</Text>

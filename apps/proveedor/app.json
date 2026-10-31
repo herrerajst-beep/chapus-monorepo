@@ -11,8 +11,15 @@
       "bundleIdentifier": "es.chapus.proveedor",
       "infoPlist": {
         "UIBackgroundModes": [
-          "remote-notification"
-        ]
+          "remote-notification",
+          "location"
+        ],
+        "NSMotionUsageDescription": "Chapus no utiliza los sensores de movimiento del dispositivo.",
+        "NSFaceIDUsageDescription": "Chapus guarda tu sesión cifrada en el llavero del dispositivo.",
+        "NSLocationTemporaryUsageDescriptionDictionary": {
+          "ExpoLocationFullAccuracy": "Necesitamos tu ubicación precisa para que el profesional llegue a la puerta correcta."
+        },
+        "NSLocationAlwaysUsageDescription": "Si lo activas, Chapus Pro actualiza tu ubicación con la app cerrada para que los clientes cercanos te encuentren mientras estás Disponible."
       }
     },
     "android": {
@@ -23,12 +30,24 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "es.chapus.proveedor"
+      "package": "es.chapus.proveedor",
+      "blockedPermissions": [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
+      [
+        "../../tools/expo-plugins/with-purpose-strings.js",
+        {
+          "NSLocationTemporaryUsageDescriptionDictionary": {
+            "ExpoLocationFullAccuracy": "Necesitamos tu ubicación precisa para que el profesional llegue a la puerta correcta."
+          }
+        }
+      ],
       "expo-router",
       "expo-secure-store",
       "expo-web-browser",
@@ -46,7 +65,11 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Chapus Pro usa tu ubicación para enviarte trabajos cercanos mientras estás disponible."
+          "locationWhenInUsePermission": "Chapus Pro usa tu ubicación para enviarte alertas de trabajo en tu zona mientras estás Disponible.",
+          "locationAlwaysAndWhenInUsePermission": "Si lo activas, Chapus Pro actualiza tu ubicación con la app cerrada para que los clientes cercanos te encuentren mientras estás Disponible.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true,
+          "isIosBackgroundLocationEnabled": true
         }
       ]
     ],

@@ -30,13 +30,12 @@ export async function setupNotificationChannels() {
 
 /**
  * Token nativo (FCM en Android / APNs en iOS): el backend usa firebase-admin directamente,
- * no Expo Push Service. Devuelve null en simulador o si se deniega el permiso.
+ * no Expo Push Service. NO pide permiso: eso lo hace `ensureNotifications()` con su
+ * pantalla de justificación. Devuelve null en simulador o sin permiso.
  */
 export async function getNativePushToken(): Promise<string | null> {
   if (!Device.isDevice) return null;
-  const current = await Notifications.getPermissionsAsync();
-  const status = current.granted ? current.status : (await Notifications.requestPermissionsAsync()).status;
-  if (status !== 'granted') return null;
+  if (!(await Notifications.getPermissionsAsync()).granted) return null;
   const token = await Notifications.getDevicePushTokenAsync();
   return typeof token.data === 'string' ? token.data : null;
 }

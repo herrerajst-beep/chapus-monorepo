@@ -1,6 +1,8 @@
 export * from './domain';
 export * from './realtime';
 export * from './validation';
+export * from './address';
+export * from './perf';
 
 const eur = new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' });
 

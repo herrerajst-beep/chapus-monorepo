@@ -1,6 +1,8 @@
 import * as Linking from 'expo-linking';
 import { initPaymentSheet, initStripe, presentPaymentSheet } from '@stripe/stripe-react-native';
-import type { PaymentSheetPayload } from '@chapus/core';
+import { createStallMonitor, type PaymentSheetPayload } from '@chapus/core';
+
+const AUDIT = __DEV__ || process.env.EXPO_PUBLIC_DIAGNOSTICS === '1';
 
 export type PaymentResult = { status: 'paid' } | { status: 'canceled' } | { status: 'failed'; message: string };
 
@@ -21,6 +23,9 @@ export async function payWithSheet(payload: PaymentSheetPayload): Promise<Paymen
     initializedKey = payload.publishableKey;
   }
 
+  // Auditoría: el PaymentSheet es nativo; el hilo JS no debería bloquearse (>50 ms) mientras se abre.
+  const monitor = AUDIT ? createStallMonitor() : null;
+  const t0 = Date.now();
   const init = await initPaymentSheet({
     merchantDisplayName: 'Chapus',
     customerId: payload.customerId,
@@ -31,9 +36,17 @@ export async function payWithSheet(payload: PaymentSheetPayload): Promise<Paymen
     googlePay: { merchantCountryCode: 'ES', testEnv: __DEV__ },
     defaultBillingDetails: { address: { country: 'ES' } },
   });
-  if (init.error) return { status: 'failed', message: init.error.message };
+  const initMs = Date.now() - t0;
+  if (init.error) {
+    monitor?.stop();
+    return { status: 'failed', message: init.error.message };
+  }
 
   const { error } = await presentPaymentSheet();
+  if (monitor) {
+    const { maxStallMs, stalls } = monitor.stop();
+    console.info(`[payments] init ${initMs} ms · sheet abierto ${Date.now() - t0 - initMs} ms · bloqueo JS máx ${maxStallMs} ms (${stalls} >50 ms)`);
+  }
   if (!error) return { status: 'paid' };
   if (error.code === 'Canceled') return { status: 'canceled' };
   return { status: 'failed', message: error.message };

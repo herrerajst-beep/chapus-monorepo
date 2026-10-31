@@ -29,6 +29,12 @@ export interface JobTakenPayload {
 export interface OffersServerEvents {
   'geo:job_alert': (payload: JobAlertPayload, ack: (res: JobAlertAck) => void) => void;
   'geo:job_taken': (payload: JobTakenPayload) => void;
+  /**
+   * PROPUESTA para Argon (aún no implementado): cambios del trabajo adjudicado emitidos a
+   * la sala `provider:{id}`, sobre todo AWAITING_PAYMENT → ASSIGNED al confirmarse el pago.
+   * Misma forma que `request:updated`. Mientras no exista, el frontend sondea por REST.
+   */
+  'job:updated': (payload: RequestUpdatedPayload) => void;
 }
 
 // ---------------------------------------------------------------------------

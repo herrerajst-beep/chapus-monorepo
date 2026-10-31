@@ -3,7 +3,7 @@ import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { ApiProvider } from '@chapus/api';
-import { palette } from '@chapus/ui';
+import { PermissionPrimerHost, palette } from '@chapus/ui';
 import { api, queryClient, session, useSession } from '@/lib/api';
 
 export default function RootLayout() {
@@ -35,6 +35,7 @@ export default function RootLayout() {
             <Stack.Screen name="login" options={{ headerShown: false }} />
           </Stack.Protected>
         </Stack>
+        <PermissionPrimerHost />
       </ApiProvider>
     </QueryClientProvider>
   );

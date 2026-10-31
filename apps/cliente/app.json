@@ -9,7 +9,16 @@
     "userInterfaceStyle": "light",
     "ios": {
       "icon": "./assets/expo.icon",
-      "bundleIdentifier": "es.chapus.cliente"
+      "bundleIdentifier": "es.chapus.cliente",
+      "infoPlist": {
+        "NSMotionUsageDescription": "Chapus no utiliza los sensores de movimiento del dispositivo.",
+        "NSFaceIDUsageDescription": "Chapus guarda tu sesión cifrada en el llavero del dispositivo.",
+        "NSLocationTemporaryUsageDescriptionDictionary": {
+          "ExpoLocationFullAccuracy": "Necesitamos tu ubicación precisa para que el profesional llegue a la puerta correcta."
+        },
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Chapus solo usa tu ubicación mientras usas la app, para encontrar profesionales cerca de tu domicilio.",
+        "NSLocationAlwaysUsageDescription": "Chapus solo usa tu ubicación mientras usas la app, para encontrar profesionales cerca de tu domicilio."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -19,13 +28,27 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "es.chapus.cliente"
+      "package": "es.chapus.cliente",
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.ACCESS_BACKGROUND_LOCATION"
+      ]
     },
     "web": {
       "output": "server",
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      [
+        "../../tools/expo-plugins/with-purpose-strings.js",
+        {
+          "NSLocationTemporaryUsageDescriptionDictionary": {
+            "ExpoLocationFullAccuracy": "Necesitamos tu ubicación precisa para que el profesional llegue a la puerta correcta."
+          }
+        }
+      ],
       "expo-router",
       [
         "expo-splash-screen",
@@ -40,7 +63,8 @@
         "expo-image-picker",
         {
           "photosPermission": "Chapus usa tus fotos para que los profesionales vean el problema y te den presupuesto.",
-          "cameraPermission": "Chapus usa la cámara para fotografiar el problema técnico."
+          "cameraPermission": "Chapus usa la cámara para fotografiar el problema técnico.",
+          "microphonePermission": false
         }
       ],
       [

@@ -3,13 +3,20 @@ import { router } from 'expo-router';
 import { useCategories, useMe, useNearbyRequests } from '@chapus/api';
 import { formatDistance, formatEur } from '@chapus/core';
 import { Badge, Button, Card, Screen, Text, palette, space } from '@chapus/ui';
-import { goOffline, goOnline, usePresenceStore } from '@/features/presence/usePresence';
+import {
+  disableBackground,
+  enableBackground,
+  goOffline,
+  goOnline,
+  usePresenceStore,
+} from '@/features/presence/usePresence';
+import { DIAGNOSTICS_ENABLED } from '@/features/diagnostics/latency';
 import { useAlerts } from '@/features/alerts/store';
 
 export default function RadarScreen() {
   const me = useMe();
   const categories = useCategories();
-  const { online, streaming, position, error } = usePresenceStore();
+  const { online, streaming, position, error, notificationsOff, background } = usePresenceStore();
   const radius = me.data?.serviceRadiusKm ?? 10;
   const nearby = useNearbyRequests(position, radius, online);
   const alerts = useAlerts((s) => s.alerts);
@@ -55,7 +62,33 @@ export default function RadarScreen() {
         {error === 'HEARTBEAT_FAILED' ? (
           <Text variant="caption" style={{ color: palette.danger }}>Sin conexión con Chapus. Reintentando…</Text>
         ) : null}
+        {online && notificationsOff ? (
+          <Text variant="caption" style={{ color: palette.danger }}>
+            Avisos desactivados: solo recibirás trabajos con la app abierta.
+          </Text>
+        ) : null}
       </Card>
+
+      {online ? (
+        <Card>
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+            <View style={{ gap: space.xs, flex: 1 }}>
+              <Text variant="heading">Disponible con la app cerrada</Text>
+              <Text variant="caption" muted>
+                {background
+                  ? 'Tu ubicación se actualiza en segundo plano mientras estés disponible.'
+                  : 'Opcional. Sin esto, tu posición solo se actualiza con la app abierta.'}
+              </Text>
+            </View>
+            <Switch
+              accessibilityLabel="Ubicación en segundo plano"
+              value={background}
+              onValueChange={(v) => void (v ? enableBackground() : disableBackground())}
+              trackColor={{ true: palette.provider, false: palette.line }}
+            />
+          </View>
+        </Card>
+      ) : null}
 
       {alerts.length > 0 ? (
         <View style={{ gap: space.sm }}>
@@ -94,6 +127,10 @@ export default function RadarScreen() {
             </Card>
           ))}
         </View>
+      ) : null}
+
+      {DIAGNOSTICS_ENABLED ? (
+        <Button tone="neutral" variant="outline" label="Diagnóstico de latencia" onPress={() => router.push('/diagnostics')} />
       ) : null}
     </Screen>
   );

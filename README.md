@@ -54,3 +54,27 @@ Antes del primer build de producción hay que hacer lo siguiente:
 3. Dar de alta el Merchant ID `merchant.es.chapus` en Apple y el dominio en Stripe para Apple Pay.
 4. Sustituir `assets/sounds/urgent_alert.wav` (tono provisional generado) por el sonido definitivo.
 5. Revisar las URLs de `staging` en `eas.json` (son supuestas: `staging-api.chapus.es`).
+
+## Auditoría en dispositivo físico
+
+1. `npx eas-cli@latest login` (cuenta Expo del equipo) y `npx eas-cli@latest init` en cada app.
+2. Android de Chapus Pro: subir `google-services.json` (FCM) con `eas credentials`; sin él no hay token push.
+3. `npx eas-cli@latest build --profile development --platform android` (y `ios`, que requiere Apple Developer). Instalar desde el QR y ejecutar `npm run proveedor`.
+4. En Chapus Pro → **Diagnóstico de latencia** (perfiles development y staging, `EXPO_PUBLIC_DIAGNOSTICS=1`):
+   - «Simular alerta» mide de evento a banner pintado (objetivo < 150 ms) sin backend.
+   - Con alertas reales mide servidor → móvil y evento → ACK.
+   - «Medir» compara el RTT HTTP en Wi-Fi, 4G y 5G.
+5. PaymentSheet: en Metro, cada pago imprime `[payments] init … · bloqueo JS máx … ms`. Más de 50 ms indica que la UI se congeló.
+
+## Permisos (cuándo y por qué)
+
+| Permiso | App | Momento | Justificación mostrada |
+|---|---|---|---|
+| Ubicación (en uso) | Pro | Al activar «Disponible» | Alertas de trabajo en tu zona |
+| Notificaciones | Pro | Mismo gesto, tras la ubicación | Avisos con el móvil bloqueado |
+| Ubicación en 2.º plano | Pro | Opt-in en el radar, ya online | Divulgación destacada de Google + aviso permanente |
+| Ubicación (en uso) | Cliente | Botón «Usar mi ubicación» (opcional, se puede escribir la dirección) | Encontrar profesionales cerca |
+| Cámara | Cliente | Botón «Cámara» | Presupuesto más preciso |
+| Galería | Cliente | Nunca: usa el selector del sistema | — |
+
+No se pide ningún permiso en el arranque ni en el login. Las pantallas previas viven en `packages/ui/src/permissions.tsx`, y los textos de Info.plist se fuerzan en español con `tools/expo-plugins/with-purpose-strings.js`.

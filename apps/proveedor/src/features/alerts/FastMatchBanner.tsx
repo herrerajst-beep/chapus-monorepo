@@ -3,8 +3,9 @@ import { Pressable, StyleSheet, View } from 'react-native';
 import { router, usePathname } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { isApiError, useCategories, useFastAccept } from '@chapus/api';
-import { FAST_MATCH_ALERT_TTL_MS, formatDistance, formatEur } from '@chapus/core';
+import { FAST_MATCH_ALERT_TTL_MS, approximateZone, formatDistance, formatEur } from '@chapus/core';
 import { Button, Text, palette, radius, space } from '@chapus/ui';
+import { useLatency } from '@/features/diagnostics/latency';
 import { useAlerts, type JobAlert } from './store';
 
 const startedAt = (a: JobAlert) => (a.request ? Date.parse(a.request.createdAt) : a.receivedAt);
@@ -18,6 +19,7 @@ export function FastMatchBanner() {
   const pathname = usePathname();
   const alert = useAlerts((s) => s.alerts.find((a) => a.pricingModel === 'FAST_MATCH'));
   const dismiss = useAlerts((s) => s.dismiss);
+  const markRendered = useLatency((s) => s.markRendered);
   const fastAccept = useFastAccept();
   const categories = useCategories();
   const categoryName = (id: number) => categories.data?.find((c) => c.id === id)?.name ?? 'Trabajo';
@@ -56,7 +58,11 @@ export function FastMatchBanner() {
     });
 
   return (
-    <View style={[styles.wrap, { paddingBottom: insets.bottom + space.md }]} accessibilityLiveRegion="assertive">
+    <View
+      style={[styles.wrap, { paddingBottom: insets.bottom + space.md }]}
+      accessibilityLiveRegion="assertive"
+      onLayout={() => markRendered(id)}
+    >
       <View style={styles.row}>
         <Text variant="heading" style={{ color: palette.provider }}>⚡ Trabajo directo</Text>
         <Text variant="caption" muted>{secondsLeft} s</Text>
@@ -67,7 +73,7 @@ export function FastMatchBanner() {
           {alert.request ? <Text muted>{formatDistance(alert.request.distanceKm)}</Text> : null}
         </View>
         <Text numberOfLines={1} muted>
-          {alert.request ? `${categoryName(alert.request.categoryId)} · ${alert.request.addressText}` : 'Toca para ver los detalles'}
+          {alert.request ? `${categoryName(alert.request.categoryId)} · ${approximateZone(alert.request.addressText)}` : 'Toca para ver los detalles'}
         </Text>
       </Pressable>
       {notice ? <Text style={{ color: palette.danger }}>{notice}</Text> : null}
