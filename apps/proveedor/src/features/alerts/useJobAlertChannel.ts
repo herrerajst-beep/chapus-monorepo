@@ -58,10 +58,11 @@ export const handleJobAlert = (
  */
 export function useJobAlertChannel() {
   useEffect(() => {
-    const { receive, dismiss, prune } = useAlerts.getState();
+    const { receive, markTaken, prune } = useAlerts.getState();
 
     const onJobAlert: OffersServerEvents['geo:job_alert'] = (payload, ack) => handleJobAlert(payload, ack);
-    const onJobTaken: OffersServerEvents['geo:job_taken'] = ({ requestId }) => dismiss(requestId);
+    // Transición suave: la alerta muestra «Otro profesional se adelantó» antes de retirarse.
+    const onJobTaken: OffersServerEvents['geo:job_taken'] = ({ requestId }) => markTaken(requestId);
 
     offersSocket.on('geo:job_alert', onJobAlert);
     offersSocket.on('geo:job_taken', onJobTaken);

@@ -6,17 +6,20 @@ import { bidSchema, fieldErrors, formatDistance, isAlertExpired } from '@chapus/
 import { Badge, Button, Card, Field, Price, Screen, Text, palette, space } from '@chapus/ui';
 import { useAlerts } from '@/features/alerts/store';
 import { useAlertRequest } from '@/features/alerts/useAlertRequest';
+import { LostOpportunity } from '@/features/alerts/LostOpportunity';
 
 export default function AlertScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const me = useMe();
   const dismiss = useAlerts((s) => s.dismiss);
-  const { request, isLoading } = useAlertRequest(id);
+  const markTaken = useAlerts((s) => s.markTaken);
+  const { request, lost, isLoading } = useAlertRequest(id);
 
   const fastAccept = useFastAccept();
   const [outcome, setOutcome] = useState<'TAKEN' | 'KYC' | 'ERROR' | null>(null);
 
   if (isLoading) return <Screen><Text muted>Cargando trabajo…</Text></Screen>;
+  if (lost || outcome === 'TAKEN') return <LostOpportunity />;
   if (!request) {
     return (
       <Screen>
@@ -37,9 +40,9 @@ export default function AlertScreen() {
         router.replace({ pathname: '/job/[id]', params: { id: request.id } });
       },
       onError: (e) => {
-        if (isApiError(e, 409)) {
+        if (isApiError(e, 409) || (isApiError(e, 403) && e.errorCode !== 'KYC_VERIFICATION_REQUIRED')) {
           setOutcome('TAKEN');
-          dismiss(request.id);
+          markTaken(request.id);
         } else if (isApiError(e, 403)) setOutcome('KYC');
         else setOutcome('ERROR');
       },
@@ -66,8 +69,6 @@ export default function AlertScreen() {
           </ScrollView>
         ) : null}
       </Card>
-
-      {outcome === 'TAKEN' ? <Text style={{ color: palette.danger }}>Otro profesional lo aceptó antes que tú.</Text> : null}
       {needsKyc ? (
         <Card style={{ borderColor: palette.provider }}>
           <Text>Tu identidad aún no está verificada en Stripe.</Text>
@@ -81,7 +82,7 @@ export default function AlertScreen() {
           tone="provider"
           label={expired ? 'Oferta caducada' : 'Aceptar trabajo'}
           loading={fastAccept.isPending}
-          disabled={expired || outcome === 'TAKEN' || needsKyc}
+          disabled={expired || needsKyc}
           onPress={accept}
         />
       ) : (

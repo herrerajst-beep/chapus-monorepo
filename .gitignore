@@ -8,3 +8,7 @@ web-build/
 !.env.example
 ios/
 android/
+
+# Credenciales de Firebase: nunca en el repositorio (ver apps/proveedor/app.config.js)
+google-services.json
+GoogleService-Info.plist

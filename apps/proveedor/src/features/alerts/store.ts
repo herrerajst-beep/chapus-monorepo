@@ -14,13 +14,20 @@ export interface JobAlert {
   receivedAt: number;
   source: 'ws' | 'push';
   request?: NearbyRequest;
+  /** Otro profesional ganó la carrera (geo:job_taken, 409 o 403 RGPD). */
+  takenAt?: number;
 }
+
+/** Tiempo que la alerta perdida sigue visible (mensaje + fundido) antes de retirarse. */
+export const TAKEN_LINGER_MS = 1_800;
 
 interface AlertsState {
   alerts: JobAlert[];
   /** Ids ya vistos: un ACK tardío puede hacer que llegue también el push. */
   seen: Set<string>;
   receive: (alert: JobAlert) => boolean;
+  /** Transición suave: marca la alerta como tomada y la retira tras TAKEN_LINGER_MS. */
+  markTaken: (requestId: string) => void;
   dismiss: (requestId: string) => void;
   prune: () => void;
 }
@@ -40,6 +47,12 @@ export const useAlerts = create<AlertsState>((set, get) => ({
     }
     set({ seen: new Set(seen).add(alert.requestId), alerts: [alert, ...alerts] });
     return true;
+  },
+  markTaken: (requestId) => {
+    const target = get().alerts.find((a) => a.requestId === requestId);
+    if (!target || target.takenAt) return;
+    set({ alerts: get().alerts.map((a) => (a.requestId === requestId ? { ...a, takenAt: Date.now() } : a)) });
+    setTimeout(() => get().dismiss(requestId), TAKEN_LINGER_MS);
   },
   dismiss: (requestId) => set({ alerts: get().alerts.filter((a) => a.requestId !== requestId) }),
   prune: () => {
