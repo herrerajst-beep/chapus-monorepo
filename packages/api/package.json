@@ -1,0 +1,21 @@
+{
+  "name": "@chapus/api",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@chapus/api-contract": "*",
+    "@chapus/core": "*",
+    "@tanstack/react-query": "^5.105.0",
+    "openapi-fetch": "^0.17.0",
+    "socket.io-client": "^4.8.4",
+    "zustand": "^5"
+  },
+  "peerDependencies": {
+    "react": "*"
+  }
+}

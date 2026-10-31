@@ -1,0 +1,274 @@
+openapi: 3.0.3
+info:
+  title: Chapus Core API - On-Demand Home Services (Spain)
+  version: 1.1.0
+  description: >
+    Contrato oficial de API (Strict Schemas) para Chapus. Incluye autenticación
+    Passwordless OTP con claims de KYC en JWT, Presigned URLs para S3/GCS,
+    consultas de detalle/ofertas y sincronización con Socket.IO v4.
+servers:
+  - url: https://api.chapus.es/v1
+    description: Servidor de Producción (España)
+  - url: http://localhost:4000/v1
+    description: Entorno de Desarrollo Local
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT firmado (HS256/RS256) que contiene { sub, role, kycStatus, stripeAccountId }.
+        Requerido para peticiones HTTP y el handshake del namespace WebSocket.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [statusCode, errorCode, message, timestamp]
+      properties:
+        statusCode:
+          type: integer
+          example: 403
+        errorCode:
+          type: string
+          example: "KYC_VERIFICATION_REQUIRED"
+        message:
+          type: string
+          example: "Debes completar la validación de tu DNI/NIE en Stripe antes de operar."
+        timestamp:
+          type: string
+          format: date-time
+
+    GeoPoint:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat:
+          type: number
+          format: double
+          example: 40.416775
+        lng:
+          type: number
+          format: double
+          example: -3.703790
+
+    UserRole:
+      type: string
+      enum: [CLIENT, PROVIDER, DUAL]
+
+    KycStatus:
+      type: string
+      enum: [UNVERIFIED, PENDING_VERIFICATION, VERIFIED, RESTRICTED]
+
+    PricingModel:
+      type: string
+      enum: [FAST_MATCH, BIDDING]
+
+    BookingStatus:
+      type: string
+      enum:
+        - OPEN
+        - AWAITING_PAYMENT
+        - ASSIGNED
+        - IN_PROGRESS
+        - COMPLETED
+        - DISPUTED
+        - CANCELLED
+
+    BidStatus:
+      type: string
+      enum: [PENDING, ACCEPTED, REJECTED, EXPIRED]
+
+    OtpChannel:
+      type: string
+      enum: [SMS, WHATSAPP]
+
+    # ==========================================
+    # ESQUEMAS DE AUTENTICACIÓN PASSWORDLESS
+    # ==========================================
+    OtpRequestPayload:
+      type: object
+      required: [phone, channel]
+      properties:
+        phone:
+          type: string
+          pattern: '^\+34[6789]\d{8}$'
+          example: "+34600112233"
+          description: Formato E.164 estricto para numeración española
+        channel:
+          $ref: '#/components/schemas/OtpChannel'
+
+    OtpVerifyPayload:
+      type: object
+      required: [phone, code, requestedRole]
+      properties:
+        phone:
+          type: string
+          example: "+34600112233"
+        code:
+          type: string
+          minLength: 6
+          maxLength: 6
+          example: "482910"
+        requestedRole:
+          $ref: '#/components/schemas/UserRole'
+        fcmToken:
+          type: string
+          nullable: true
+
+    AuthSessionResponse:
+      type: object
+      required: [accessToken, refreshToken, expiresIn, user]
+      properties:
+        accessToken:
+          type: string
+          description: >
+            JWT con payload: { sub: uuid, role: UserRole, kycStatus: KycStatus, iat, exp }.
+            Si kycStatus != 'VERIFIED', el servidor WS rechazará la conexión a /offers con 403.
+        refreshToken:
+          type: string
+        expiresIn:
+          type: integer
+          example: 86400
+        user:
+          $ref: '#/components/schemas/UserProfile'
+
+    UserProfile:
+      type: object
+      required:
+        - id
+        - phone
+        - fullName
+        - activeRole
+        - kycStatus
+        - stripeAccountId
+        - isOnline
+        - serviceRadiusKm
+        - ratingAvg
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          nullable: true
+        phone:
+          type: string
+          example: "+34600112233"
+        fullName:
+          type: string
+          example: "Carlos Gómez"
+        activeRole:
+          $ref: '#/components/schemas/UserRole'
+        kycStatus:
+          $ref: '#/components/schemas/KycStatus'
+        stripeAccountId:
+          type: string
+          nullable: true
+          example: "acct_1Pxyz..."
+        isOnline:
+          type: boolean
+        serviceRadiusKm:
+          type: number
+          example: 15.0
+        ratingAvg:
+          type: number
+          example: 4.85
+
+    # ==========================================
+    # ESQUEMAS DE SUBIDA DE ARCHIVOS (S3 / GCS)
+    # ==========================================
+    PresignUploadRequest:
+      type: object
+      required: [fileName, contentType, fileSizeBytes, purpose]
+      properties:
+        fileName:
+          type: string
+          example: "fuga_fregadero_01.jpg"
+        contentType:
+          type: string
+          enum: [image/jpeg, image/png, image/webp, video/mp4]
+        fileSizeBytes:
+          type: integer
+          maximum: 15728640 # Límite estricto de 15 MB por anexo técnico
+          example: 2450120
+        purpose:
+          type: string
+          enum: [ISSUE_ATTACHMENT, COMPLETION_PROOF, AVATAR]
+
+    PresignUploadResponse:
+      type: object
+      required: [uploadUrl, publicFileUrl, fileKey, expiresInSeconds, requiredHeaders]
+      properties:
+        uploadUrl:
+          type: string
+          format: uri
+          description: URL firmada (PUT) para subida binaria directa desde React Native a S3/GCS
+        publicFileUrl:
+          type: string
+          format: uri
+          description: URL final de CDN (CloudFront) que se enviará en photoUrls al crear la solicitud
+        fileKey:
+          type: string
+          example: "issues/2026/10/uuid-fuga_fregadero_01.jpg"
+        expiresInSeconds:
+          type: integer
+          example: 300
+        requiredHeaders:
+          type: object
+          required: [Content-Type]
+          properties:
+            Content-Type:
+              type: string
+              example: "image/jpeg"
+
+    # ==========================================
+    # ESQUEMAS DE CATÁLOGO, SOLICITUDES Y OFERTAS
+    # ==========================================
+    ServiceCategory:
+      type: object
+      required: [id, slug, name, allowedModels, baseFixedPriceEur, platformFeePercent]
+      properties:
+        id:
+          type: integer
+          example: 101
+        slug:
+          type: string
+          example: "limpieza-expres"
+        name:
+          type: string
+          example: "Limpieza Exprés a Domicilio"
+        allowedModels:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingModel'
+        baseFixedPriceEur:
+          type: number
+          format: float
+          example: 55.00
+        platformFeePercent:
+          type: number
+          format: float
+          example: 15.00
+
+    ServiceRequestCreate:
+      type: object
+      required:
+        - categoryId
+        - pricingModel
+        - location
+        - addressText
+        - description
+        - photoUrls
+      properties:
+        categoryId:
+          type: integer
+        pricingModel:
+          $ref: '#/components/schemas/PricingModel'
+        offeredPriceEur:
+          type: number
+          format: float
+          nullable: true
+          example: 65.0

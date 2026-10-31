@@ -1,0 +1,674 @@
+openapi: 3.0.3
+info:
+  title: Chapus Core API - On-Demand Home Services (Spain)
+  version: 1.1.0-frontend-merge
+  description: >
+    Contrato oficial de API (Strict Schemas) para Chapus. Incluye autenticación
+    Passwordless OTP con claims de KYC en JWT, Presigned URLs para S3/GCS,
+    consultas de detalle/ofertas y sincronización con Socket.IO v4.
+servers:
+  - url: https://api.chapus.es/v1
+    description: Servidor de Producción (España)
+  - url: http://localhost:4000/v1
+    description: Entorno de Desarrollo Local
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT firmado (HS256/RS256) que contiene { sub, role, kycStatus, stripeAccountId }.
+        Requerido para peticiones HTTP y el handshake del namespace WebSocket.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [statusCode, errorCode, message, timestamp]
+      properties:
+        statusCode:
+          type: integer
+          example: 403
+        errorCode:
+          type: string
+          example: "KYC_VERIFICATION_REQUIRED"
+        message:
+          type: string
+          example: "Debes completar la validación de tu DNI/NIE en Stripe antes de operar."
+        timestamp:
+          type: string
+          format: date-time
+
+    GeoPoint:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat:
+          type: number
+          format: double
+          example: 40.416775
+        lng:
+          type: number
+          format: double
+          example: -3.703790
+
+    UserRole:
+      type: string
+      enum: [CLIENT, PROVIDER, DUAL]
+
+    KycStatus:
+      type: string
+      enum: [UNVERIFIED, PENDING_VERIFICATION, VERIFIED, RESTRICTED]
+
+    PricingModel:
+      type: string
+      enum: [FAST_MATCH, BIDDING]
+
+    BookingStatus:
+      type: string
+      enum:
+        - OPEN
+        - AWAITING_PAYMENT
+        - ASSIGNED
+        - IN_PROGRESS
+        - COMPLETED
+        - DISPUTED
+        - CANCELLED
+
+    BidStatus:
+      type: string
+      enum: [PENDING, ACCEPTED, REJECTED, EXPIRED]
+
+    OtpChannel:
+      type: string
+      enum: [SMS, WHATSAPP]
+
+    # ==========================================
+    # ESQUEMAS DE AUTENTICACIÓN PASSWORDLESS
+    # ==========================================
+    OtpRequestPayload:
+      type: object
+      required: [phone, channel]
+      properties:
+        phone:
+          type: string
+          pattern: '^\+34[6789]\d{8}$'
+          example: "+34600112233"
+          description: Formato E.164 estricto para numeración española
+        channel:
+          $ref: '#/components/schemas/OtpChannel'
+
+    OtpVerifyPayload:
+      type: object
+      required: [phone, code, requestedRole]
+      properties:
+        phone:
+          type: string
+          example: "+34600112233"
+        code:
+          type: string
+          minLength: 6
+          maxLength: 6
+          example: "482910"
+        requestedRole:
+          $ref: '#/components/schemas/UserRole'
+        fcmToken:
+          type: string
+          nullable: true
+
+    AuthSessionResponse:
+      type: object
+      required: [accessToken, refreshToken, expiresIn, user]
+      properties:
+        accessToken:
+          type: string
+          description: >
+            JWT con payload: { sub: uuid, role: UserRole, kycStatus: KycStatus, iat, exp }.
+            Si kycStatus != 'VERIFIED', el servidor WS rechazará la conexión a /offers con 403.
+        refreshToken:
+          type: string
+        expiresIn:
+          type: integer
+          example: 86400
+        user:
+          $ref: '#/components/schemas/UserProfile'
+
+    UserProfile:
+      type: object
+      required:
+        - id
+        - phone
+        - fullName
+        - activeRole
+        - kycStatus
+        - stripeAccountId
+        - isOnline
+        - serviceRadiusKm
+        - ratingAvg
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          nullable: true
+        phone:
+          type: string
+          example: "+34600112233"
+        fullName:
+          type: string
+          example: "Carlos Gómez"
+        activeRole:
+          $ref: '#/components/schemas/UserRole'
+        kycStatus:
+          $ref: '#/components/schemas/KycStatus'
+        stripeAccountId:
+          type: string
+          nullable: true
+          example: "acct_1Pxyz..."
+        isOnline:
+          type: boolean
+        serviceRadiusKm:
+          type: number
+          example: 15.0
+        ratingAvg:
+          type: number
+          example: 4.85
+
+    # ==========================================
+    # ESQUEMAS DE SUBIDA DE ARCHIVOS (S3 / GCS)
+    # ==========================================
+    PresignUploadRequest:
+      type: object
+      required: [fileName, contentType, fileSizeBytes, purpose]
+      properties:
+        fileName:
+          type: string
+          example: "fuga_fregadero_01.jpg"
+        contentType:
+          type: string
+          enum: [image/jpeg, image/png, image/webp, video/mp4]
+        fileSizeBytes:
+          type: integer
+          maximum: 15728640 # Límite estricto de 15 MB por anexo técnico
+          example: 2450120
+        purpose:
+          type: string
+          enum: [ISSUE_ATTACHMENT, COMPLETION_PROOF, AVATAR]
+
+    PresignUploadResponse:
+      type: object
+      required: [uploadUrl, publicFileUrl, fileKey, expiresInSeconds, requiredHeaders]
+      properties:
+        uploadUrl:
+          type: string
+          format: uri
+          description: URL firmada (PUT) para subida binaria directa desde React Native a S3/GCS
+        publicFileUrl:
+          type: string
+          format: uri
+          description: URL final de CDN (CloudFront) que se enviará en photoUrls al crear la solicitud
+        fileKey:
+          type: string
+          example: "issues/2026/10/uuid-fuga_fregadero_01.jpg"
+        expiresInSeconds:
+          type: integer
+          example: 300
+        requiredHeaders:
+          type: object
+          required: [Content-Type]
+          properties:
+            Content-Type:
+              type: string
+              example: "image/jpeg"
+
+    # ==========================================
+    # ESQUEMAS DE CATÁLOGO, SOLICITUDES Y OFERTAS
+    # ==========================================
+    ServiceCategory:
+      type: object
+      required: [id, slug, name, allowedModels, baseFixedPriceEur, platformFeePercent]
+      properties:
+        id:
+          type: integer
+          example: 101
+        slug:
+          type: string
+          example: "limpieza-expres"
+        name:
+          type: string
+          example: "Limpieza Exprés a Domicilio"
+        allowedModels:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingModel'
+        baseFixedPriceEur:
+          type: number
+          format: float
+          example: 55.00
+        platformFeePercent:
+          type: number
+          format: float
+          example: 15.00
+
+    ServiceRequestCreate:
+      type: object
+      required:
+        - categoryId
+        - pricingModel
+        - location
+        - addressText
+        - description
+        - photoUrls
+      properties:
+        categoryId:
+          type: integer
+        pricingModel:
+          $ref: '#/components/schemas/PricingModel'
+        offeredPriceEur:
+          type: number
+          format: float
+          nullable: true
+          description: Obligatorio si pricingModel == FAST_MATCH. Orientativo (o null) si es BIDDING.
+        location:
+          $ref: '#/components/schemas/GeoPoint'
+        addressText:
+          type: string
+          example: "Calle de Alcalá 45, 3ºB, 28014 Madrid"
+        description:
+          type: string
+        photoUrls:
+          type: array
+          items:
+            type: string
+            format: uri
+        scheduledAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Si es null, se considera servicio inmediato (Urgencia)
+
+    # ---------------------------------------------------------------------------
+    # RECONSTRUIDO POR FRONTEND a partir de bookings.service.ts y realtime.gateway.ts
+    # (la v1.1.0 llegó truncada en la línea 273). Sustituir por el original de Argon
+    # y ejecutar `npm run gen:api`: el typecheck señalará cualquier diferencia.
+    # ---------------------------------------------------------------------------
+    ServiceRequestResponse:
+      allOf:
+        - $ref: '#/components/schemas/ServiceRequestCreate'
+        - type: object
+          required: [id, clientId, assignedProviderId, finalAgreedPriceEur, status, bidsCount, version, scheduledAt, createdAt, acceptedAt, completedAt]
+          properties:
+            id: { type: string, format: uuid }
+            clientId: { type: string, format: uuid }
+            assignedProviderId: { type: string, format: uuid, nullable: true }
+            finalAgreedPriceEur: { type: number, format: float, nullable: true }
+            status: { $ref: '#/components/schemas/BookingStatus' }
+            bidsCount: { type: integer }
+            version: { type: integer }
+            scheduledAt: { type: string, format: date-time, nullable: true }
+            createdAt: { type: string, format: date-time }
+            acceptedAt: { type: string, format: date-time, nullable: true }
+            completedAt: { type: string, format: date-time, nullable: true }
+
+    NearbyRequest:
+      allOf:
+        - $ref: '#/components/schemas/ServiceRequestResponse'
+        - type: object
+          required: [distanceKm]
+          properties:
+            distanceKm: { type: number }
+
+    BidCreate:
+      type: object
+      required: [amountEur, estimatedArrivalMinutes]
+      properties:
+        amountEur: { type: number, format: float }
+        estimatedArrivalMinutes: { type: integer }
+        notes: { type: string, nullable: true }
+
+    BidProviderSummary:
+      type: object
+      required: [id, fullName, ratingAvg, completedJobsCount, avatarUrl]
+      properties:
+        id: { type: string, format: uuid }
+        fullName: { type: string }
+        ratingAvg: { type: number }
+        completedJobsCount: { type: integer }
+        avatarUrl: { type: string, format: uri, nullable: true }
+
+    BidResponse:
+      type: object
+      required: [id, requestId, providerId, provider, amountEur, estimatedArrivalMinutes, notes, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        requestId: { type: string, format: uuid }
+        providerId: { type: string, format: uuid }
+        provider: { $ref: '#/components/schemas/BidProviderSummary' }
+        amountEur: { type: number, format: float }
+        estimatedArrivalMinutes: { type: integer }
+        notes: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/BidStatus' }
+        createdAt: { type: string, format: date-time }
+
+    StripePaymentSheetPayload:
+      type: object
+      required: [paymentIntentClientSecret, ephemeralKey, customerId, publishableKey, amountEur, currency]
+      properties:
+        paymentIntentClientSecret: { type: string }
+        ephemeralKey: { type: string }
+        customerId: { type: string }
+        publishableKey: { type: string }
+        amountEur: { type: number }
+        currency: { type: string, enum: [eur] }
+
+    CheckoutResponse:
+      type: object
+      required: [request, paymentSheet]
+      properties:
+        request: { $ref: '#/components/schemas/ServiceRequestResponse' }
+        paymentSheet:
+          type: object
+          allOf: [{ $ref: '#/components/schemas/StripePaymentSheetPayload' }]
+          nullable: true
+          description: null en BIDDING al crear la solicitud
+
+  responses:
+    Error:
+      description: Error estructurado
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  parameters:
+    RequestId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+
+paths:
+  /auth/otp/request:
+    post:
+      summary: Envía un código OTP de 6 dígitos por SMS o WhatsApp
+      tags: [Auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OtpRequestPayload' }
+      responses:
+        '204': { description: Código enviado }
+        '429': { $ref: '#/components/responses/Error' }
+
+  /auth/otp/verify:
+    post:
+      summary: Verifica el OTP y emite la sesión (JWT con claim kycStatus)
+      tags: [Auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OtpVerifyPayload' }
+      responses:
+        '200':
+          description: Sesión creada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSessionResponse' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /auth/refresh:
+    post:
+      summary: "[SUPUESTO POR FRONTEND] Renueva la sesión y re-firma el claim kycStatus"
+      tags: [Auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: Sesión renovada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSessionResponse' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /auth/me:
+    get:
+      summary: Perfil del usuario actual y estado KYC
+      tags: [Auth]
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Perfil
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserProfile' }
+
+  /auth/kyc/stripe-onboarding:
+    post:
+      summary: Enlace de Stripe Connect Express (DNI/NIE + IBAN)
+      tags: [Auth]
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [returnUrl, refreshUrl]
+              properties:
+                returnUrl: { type: string }
+                refreshUrl: { type: string }
+      responses:
+        '200':
+          description: URL de onboarding
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [onboardingUrl, stripeAccountId]
+                properties:
+                  onboardingUrl: { type: string, format: uri }
+                  stripeAccountId: { type: string }
+
+  /uploads/presign:
+    post:
+      summary: URL firmada (PUT) para subir un anexo directamente a S3/GCS
+      tags: [Storage]
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PresignUploadRequest' }
+      responses:
+        '200':
+          description: URL firmada (expira en expiresInSeconds)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PresignUploadResponse' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+
+  /catalog/categories:
+    get:
+      summary: Categorías y precios base
+      tags: [Catalog]
+      security: []
+      responses:
+        '200':
+          description: Catálogo activo
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ServiceCategory' }
+
+  /geo/provider-heartbeat:
+    patch:
+      summary: Actualiza ubicación del autónomo
+      tags: [Geolocation]
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [location, isOnline]
+              properties:
+                location: { $ref: '#/components/schemas/GeoPoint' }
+                isOnline: { type: boolean }
+                fcmToken: { type: string }
+      responses:
+        '204': { description: Registrado }
+
+  /geo/nearby-requests:
+    get:
+      summary: Solicitudes abiertas en el radio del proveedor
+      tags: [Geolocation]
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { in: query, name: lat, required: true, schema: { type: number } }
+        - { in: query, name: lng, required: true, schema: { type: number } }
+        - { in: query, name: radiusKm, required: false, schema: { type: number, default: 10 } }
+      responses:
+        '200':
+          description: Ordenadas por distancia
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/NearbyRequest' }
+
+  /requests:
+    post:
+      summary: Crea una solicitud e inicia el broadcasting geoespacial
+      tags: [Bookings]
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceRequestCreate' }
+      responses:
+        '201':
+          description: Creada (paymentSheet presente en FAST_MATCH)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutResponse' }
+
+  /requests/{id}:
+    get:
+      summary: Detalle de la solicitud
+      tags: [Bookings]
+      security: [{ BearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      responses:
+        '200':
+          description: Detalle
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceRequestResponse' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /requests/{id}/fast-accept:
+    post:
+      summary: "[FAST-MATCH] Aceptación atómica"
+      tags: [Bookings - Fast-Match]
+      security: [{ BearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      responses:
+        '200':
+          description: Adjudicado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceRequestResponse' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /requests/{id}/bids:
+    get:
+      summary: "[BIDDING] Ofertas de una solicitud (más recientes primero)"
+      tags: [Bookings - Bidding]
+      security: [{ BearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      responses:
+        '200':
+          description: Ofertas
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/BidResponse' }
+    post:
+      summary: "[BIDDING] Envía un presupuesto"
+      tags: [Bookings - Bidding]
+      security: [{ BearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BidCreate' }
+      responses:
+        '201':
+          description: Oferta registrada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BidResponse' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /requests/{id}/bids/{bidId}/accept:
+    post:
+      summary: "[BIDDING] El cliente acepta un presupuesto (cobro en Escrow)"
+      tags: [Bookings - Bidding]
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/RequestId' }
+        - { in: path, name: bidId, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Presupuesto bloqueado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutResponse' }
+
+  /requests/{id}/start:
+    post:
+      summary: El profesional inicia el trabajo
+      tags: [Booking Lifecycle]
+      security: [{ BearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      responses:
+        '200':
+          description: IN_PROGRESS
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceRequestResponse' }
+
+  /requests/{id}/complete:
+    post:
+      summary: El cliente confirma y libera los fondos
+      tags: [Booking Lifecycle]
+      security: [{ BearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      responses:
+        '200':
+          description: COMPLETED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceRequestResponse' }
