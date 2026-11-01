@@ -25,6 +25,7 @@ Protocolo para medir la latencia en red móvil real y validar la transición al 
 
 | Fecha | Operador | Red | A p50/p95 | B RTT medio | C p50/p95 | D p95 (servidor) | E | Notas |
 |---|---|---|---|---|---|---|---|---|
+| 31/10/2026 | — | 4G+ | 111 / 134 ms (máx 223, n=20) ✅ | 159 ms (137–185, n=5, staging Frankfurt) | servidor→móvil 275 / 394 ms (n=14); ACK 0,5 / 9,5 ms; banner 88 / 276 ms ⚠️ (n=19) | p50 100,6 / p95 206,4 ms ✅ (n=20, 20/20 ACK_RECEIVED, máx 746,7 aislado) | ✅ app cerrada y bloqueada: push FCM 1,2 s, notificación en canal `chapus_urgent_jobs` a los 2,1 s del envío | A en modo demo sin backend (ACK 0 ms, n=20). C con alertas reales en 22600 Sabiñánigo; build de desarrollo. El p95 del banner con alertas reales lo marca una sola muestra (con n=19, p95 = máx): repetir en build de staging |
 | | | | | | | | | |
 
 ## Pérdida de oportunidad (transición visual)
