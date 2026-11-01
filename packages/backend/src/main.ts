@@ -1,41 +1,48 @@
 import http from 'http';
-import { randomBytes, randomInt } from 'crypto';
+import { randomBytes, randomInt, timingSafeEqual } from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import { Server as SocketServer } from 'socket.io';
 import { Pool } from 'pg';
 import { Redis } from 'ioredis';
 import jwt from 'jsonwebtoken';
+import * as admin from 'firebase-admin';
+import Stripe from 'stripe';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 import { verifyAndProvisionPostGIS } from './database/provision-postgis';
 import { createHealthHandler } from './modules/health/health.controller';
 import {
   ServiceRequestSerializer,
   ServiceRequestRow,
+  BookingStatus,
 } from './modules/bookings/serializers/service-request.serializer';
 import { deriveApproximateZone } from './modules/bookings/utils/derive-zone';
 import { JobStateBroadcaster } from './modules/realtime/job-state-broadcaster';
 import { GeoDispatcherService } from './modules/dispatch/geo-dispatcher.service';
 
-// 1. VALIDACIÓN ESTRICTA DE SECRETOS (Fail-Fast)
-// Función en vez de `if` suelto: el estrechamiento a `string` debe sobrevivir dentro de los closures.
 function requireJwtSecret(): string {
   const secret = process.env.JWT_SECRET;
   if (!secret || secret.trim().length < 16) {
-    console.error(
-      '[FATAL] Variable de entorno JWT_SECRET ausente o insegura (<16 chars). Abortando arranque.'
-    );
+    console.error('[FATAL] JWT_SECRET ausente o inseguro (<16 chars).');
     process.exit(1);
   }
   return secret;
 }
 
 const JWT_SECRET = requireJwtSecret();
-
 const PORT = Number(process.env.PORT || 4000);
-
-// Bandera estricta de entorno: solo permite atajos de auditoría fuera de producción
 const IS_STAGING_OR_DEV =
   process.env.NODE_ENV === 'staging' || process.env.NODE_ENV === 'development';
+
+const stripeSecret = process.env.STRIPE_SECRET_KEY || '';
+const hasRealStripe =
+  (stripeSecret.startsWith('sk_test_') || stripeSecret.startsWith('sk_live_')) &&
+  !stripeSecret.includes('placeholder');
+
+const stripe = hasRealStripe
+  ? new Stripe(stripeSecret, { apiVersion: '2024-06-20' as any })
+  : null;
 
 interface JwtClaims {
   sub: string;
@@ -67,6 +74,34 @@ const SELECT_REQUEST_COLUMNS = `
   (SELECT COUNT(*)::int FROM bids b WHERE b.request_id = sr.id AND b.status = 'PENDING') AS bids_count
 `;
 
+function initializeFcmMessaging(logger: { info: Function; warn: Function }): admin.messaging.Messaging {
+  const rawCreds = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (rawCreds && rawCreds.trim().length > 20) {
+    try {
+      const parsed = rawCreds.trim().startsWith('{')
+        ? JSON.parse(rawCreds)
+        : JSON.parse(Buffer.from(rawCreds, 'base64').toString('utf8'));
+
+      if (admin.apps.length === 0) {
+        admin.initializeApp({ credential: admin.credential.cert(parsed) });
+      }
+      logger.info({ projectId: parsed.project_id }, '[FCM] Firebase Admin activo (REAL)');
+      return admin.messaging();
+    } catch (err: any) {
+      logger.warn({ err: err?.message }, '[FCM] Fallo al parsear FIREBASE_SERVICE_ACCOUNT_JSON; usando stub');
+    }
+  } else {
+    logger.warn({}, '[FCM] FIREBASE_SERVICE_ACCOUNT_JSON ausente; usando stub');
+  }
+
+  return {
+    sendEachForMulticast: async (payload: any) => {
+      logger.warn({ tokensCount: payload?.tokens?.length || 0 }, '[FCM Stub] Push simulado');
+      return { successCount: 0, failureCount: 0, responses: [] };
+    },
+  } as unknown as admin.messaging.Messaging;
+}
+
 async function seedDefaultCategories(db: Pool) {
   await db.query(`
     INSERT INTO service_categories (id, name, slug, allowed_models, base_fixed_price_eur, platform_fee_percent)
@@ -76,6 +111,92 @@ async function seedDefaultCategories(db: Pool) {
       (103, 'Electricidad y Averías', 'electricidad-averias', '{FAST_MATCH,BIDDING}', 70.00, 15.00)
     ON CONFLICT (slug) DO NOTHING;
   `);
+}
+
+async function createPaymentSheetPayload(
+  db: Pool,
+  userId: string,
+  requestId: string,
+  amountEur: number
+) {
+  if (!stripe) {
+    if (!IS_STAGING_OR_DEV) {
+      const err: any = new Error('Pasarela de pago no configurada en producción.');
+      err.statusCode = 503;
+      err.errorCode = 'PAYMENT_GATEWAY_UNAVAILABLE';
+      throw err;
+    }
+    return {
+      paymentIntentClientSecret: `pi_staging_${requestId}_secret_demo`,
+      ephemeralKey: `ek_staging_${requestId}`,
+      customerId: `cus_staging_${userId.slice(0, 8)}`,
+      publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || 'pk_test_chapus_staging',
+      amountEur,
+      currency: 'eur' as const,
+    };
+  }
+
+  const amountCents = Math.round(amountEur * 100);
+  const userRes = await db.query(
+    `SELECT email, phone, full_name, stripe_customer_id FROM users WHERE id = $1`,
+    [userId]
+  );
+  let customerId: string | null = userRes.rows[0]?.stripe_customer_id || null;
+
+  if (!customerId) {
+    const customer = await stripe.customers.create({
+      phone: userRes.rows[0]?.phone,
+      name: userRes.rows[0]?.full_name,
+      metadata: { chapusUserId: userId },
+    });
+    customerId = customer.id;
+    await db.query(`UPDATE users SET stripe_customer_id = $1 WHERE id = $2`, [customerId, userId]);
+  }
+
+  const ephemeralKey = await stripe.ephemeralKeys.create(
+    { customer: customerId },
+    { apiVersion: '2024-06-20' }
+  );
+
+  // CORRECCIÓN #5: capture_method: 'manual' para retener fondos en Escrow sin capturarlos aún
+  const paymentIntent = await stripe.paymentIntents.create(
+    {
+      amount: amountCents,
+      currency: 'eur',
+      customer: customerId,
+      capture_method: 'manual',
+      automatic_payment_methods: { enabled: true },
+      transfer_group: `CHAPUS_REQ_${requestId}`,
+      metadata: { requestId, clientId: userId },
+    },
+    { idempotencyKey: `pi_manual_${requestId}_${amountCents}` }
+  );
+
+  const feeEur = Number((amountEur * 0.15).toFixed(2));
+  const netEur = Number((amountEur - feeEur).toFixed(2));
+
+  await db.query(
+    `INSERT INTO payments (
+       request_id, client_id, stripe_payment_intent_id,
+       total_amount, platform_fee, provider_payout, status
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, 'REQUIRES_CAPTURE')
+     ON CONFLICT (request_id) DO UPDATE
+       SET stripe_payment_intent_id = EXCLUDED.stripe_payment_intent_id,
+           total_amount = EXCLUDED.total_amount,
+           platform_fee = EXCLUDED.platform_fee,
+           provider_payout = EXCLUDED.provider_payout`,
+    [requestId, userId, paymentIntent.id, amountEur, feeEur, netEur]
+  );
+
+  return {
+    paymentIntentClientSecret: paymentIntent.client_secret!,
+    ephemeralKey: ephemeralKey.secret!,
+    customerId,
+    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY!,
+    amountEur,
+    currency: 'eur' as const,
+  };
 }
 
 async function bootstrap() {
@@ -92,18 +213,6 @@ async function bootstrap() {
     maxRetriesPerRequest: 3,
   });
 
-  await verifyAndProvisionPostGIS(db);
-  await seedDefaultCategories(db);
-
-  const app = express();
-  app.use(express.json({ limit: '2mb' }));
-
-  const httpServer = http.createServer(app);
-  const io = new SocketServer(httpServer, {
-    cors: { origin: '*', methods: ['GET', 'POST', 'PATCH'] },
-    transports: ['websocket', 'polling'],
-  });
-
   const logger = {
     info: (obj: object, msg: string) =>
       console.log(JSON.stringify({ level: 'INFO', msg, ...obj, ts: new Date().toISOString() })),
@@ -113,15 +222,169 @@ async function bootstrap() {
       console.error(JSON.stringify({ level: 'ERROR', msg, ...obj, ts: new Date().toISOString() })),
   };
 
-  const broadcaster = new JobStateBroadcaster(io);
-  const fcmStub: any = {
-    sendEachForMulticast: async () => ({ successCount: 0, failureCount: 0 }),
-  };
-  const dispatcher = new GeoDispatcherService(io, fcmStub, logger);
+  await verifyAndProvisionPostGIS(db);
+  await seedDefaultCategories(db);
 
-  // ==========================================
-  // NAMESPACES SOCKET.IO v4 (/offers y /bookings)
-  // ==========================================
+  const app = express();
+  const httpServer = http.createServer(app);
+  const io = new SocketServer(httpServer, {
+    cors: { origin: '*', methods: ['GET', 'POST', 'PATCH', 'PUT'] },
+    transports: ['websocket', 'polling'],
+  });
+
+  const broadcaster = new JobStateBroadcaster(io);
+  const fcmMessaging = initializeFcmMessaging(logger);
+  const dispatcher = new GeoDispatcherService(io, fcmMessaging, logger);
+
+  async function findCandidatesAndDispatch(row: ServiceRequestRow) {
+    const candidatesRes = await db.query(
+      `SELECT
+         u.id AS "providerId",
+         u.fcm_token AS "fcmToken",
+         COALESCE(
+           ROUND((ST_Distance(u.last_location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) / 1000)::numeric, 2)::float,
+           1.2
+         ) AS "distanceKm"
+       FROM users u
+       WHERE u.role IN ('PROVIDER', 'DUAL')
+         AND u.is_online = TRUE
+         AND u.kyc_status = 'VERIFIED'
+         AND u.id <> $3
+         AND (
+           u.last_location IS NULL
+           OR ST_DWithin(
+             u.last_location,
+             ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+             u.service_radius_km * 1000
+           )
+         )
+       LIMIT 25`,
+      [Number(row.lng), Number(row.lat), row.client_id]
+    );
+
+    if (candidatesRes.rows.length > 0) {
+      await redis.sadd(
+        `notified_providers:${row.id}`,
+        ...candidatesRes.rows.map((c: any) => c.providerId)
+      );
+      await redis.expire(`notified_providers:${row.id}`, 3600);
+    }
+
+    await dispatcher.dispatchJobOffer(row, candidatesRes.rows, 1);
+  }
+
+  // CORRECCIÓN #6: Incluye la clave `job` que espera Chapus Pro (y `request` por compatibilidad)
+  function emitBookingAssignedToProvider(row: ServiceRequestRow, escrowStatus: string = 'ESCROW_HELD') {
+    if (!row.assigned_provider_id) return;
+    const unmaskedProviderDto = ServiceRequestSerializer.toDTO(row, row.assigned_provider_id);
+    const grossPrice = Number(row.final_agreed_price || row.offered_price || 0);
+    const guaranteedPayoutEur = Number((grossPrice * 0.85).toFixed(2));
+
+    io.of('/offers')
+      .to(`provider:${row.assigned_provider_id}`)
+      .emit('booking:assigned', {
+        job: unmaskedProviderDto,
+        request: unmaskedProviderDto,
+        escrowStatus,
+        guaranteedPayoutEur,
+        assignedAt: new Date().toISOString(),
+      });
+  }
+
+  // CORRECCIÓN #1 y #5: Webhook con firma obligatoria y soporte para amount_capturable_updated
+  app.post(
+    '/v1/webhooks/stripe',
+    express.raw({ type: 'application/json' }),
+    async (req: Request, res: Response) => {
+      const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+      if (!stripe || !webhookSecret || webhookSecret.includes('placeholder')) {
+        if (!IS_STAGING_OR_DEV) {
+          return res.status(500).json({ error: 'STRIPE_WEBHOOK_NOT_CONFIGURED' });
+        }
+        return res.status(200).json({ received: true, mode: 'staging_stub' });
+      }
+
+      const sig = req.headers['stripe-signature'];
+      if (!sig || typeof sig !== 'string') {
+        return res.status(400).json({ error: 'MISSING_STRIPE_SIGNATURE' });
+      }
+
+      let event: Stripe.Event;
+      try {
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+      } catch (err: any) {
+        logger.error({ err: err?.message }, '[Stripe Webhook] Firma inválida');
+        return res.status(400).send(`Webhook Error: ${err?.message}`);
+      }
+
+      try {
+        if (event.type === 'account.updated') {
+          const account = event.data.object as Stripe.Account;
+          const chapusUserId = account.metadata?.chapusUserId;
+          if (chapusUserId) {
+            let newKyc: JwtClaims['kycStatus'] = 'PENDING_VERIFICATION';
+            if (account.charges_enabled && account.payouts_enabled) {
+              newKyc = 'VERIFIED';
+            } else if (account.requirements?.disabled_reason) {
+              newKyc = 'RESTRICTED';
+            }
+            await db.query(
+              `UPDATE users SET kyc_status = $1, updated_at = NOW() WHERE id = $2`,
+              [newKyc, chapusUserId]
+            );
+            logger.info({ chapusUserId, newKyc }, '[Stripe KYC] Actualizado por webhook');
+          }
+        } else if (
+          event.type === 'payment_intent.amount_capturable_updated' ||
+          event.type === 'payment_intent.succeeded'
+        ) {
+          const pi = event.data.object as Stripe.PaymentIntent;
+          const requestId = pi.metadata?.requestId;
+          if (requestId) {
+            await db.query(
+              `UPDATE payments SET status = 'ESCROW_HELD', captured_at = NOW() WHERE stripe_payment_intent_id = $1`,
+              [pi.id]
+            );
+
+            const reqRes = await db.query(
+              `UPDATE service_requests sr
+               SET status = CASE WHEN sr.status = 'AWAITING_PAYMENT' THEN 'ASSIGNED'::request_status ELSE sr.status END,
+                   version = sr.version + 1
+               WHERE sr.id = $1
+               RETURNING ${SELECT_REQUEST_COLUMNS}`,
+              [requestId]
+            );
+
+            if (reqRes.rowCount && reqRes.rowCount > 0) {
+              const row: ServiceRequestRow = reqRes.rows[0];
+              if (row.assigned_provider_id && row.status === 'ASSIGNED') {
+                broadcaster.emitJobStateTransition(row, 'AWAITING_PAYMENT');
+                emitBookingAssignedToProvider(row, 'ESCROW_HELD');
+              } else if (row.status === 'OPEN' && row.pricing_model === 'FAST_MATCH') {
+                await findCandidatesAndDispatch(row);
+              }
+            }
+          }
+        }
+        return res.status(200).json({ received: true });
+      } catch (err: any) {
+        logger.error({ err: err?.message }, '[Stripe Webhook] Error procesando evento');
+        return res.status(500).json({ error: 'WEBHOOK_HANDLER_FAILED' });
+      }
+    }
+  );
+
+  // Endpoint PUT binario para recibir fotos cuando S3 no está configurado en Staging
+  app.put(
+    '/v1/uploads/stub/*',
+    express.raw({ type: '*/*', limit: '15mb' }),
+    (_req: Request, res: Response) => {
+      return res.status(200).send();
+    }
+  );
+
+  app.use(express.json({ limit: '2mb' }));
+
   const offersNsp = io.of('/offers');
   offersNsp.use((socket, next) => {
     try {
@@ -162,7 +425,7 @@ async function bootstrap() {
   offersNsp.on('connection', (socket) => {
     const providerId = socket.data.user.sub;
     socket.join(`provider:${providerId}`);
-    logger.info({ providerId, socketId: socket.id }, '[WS /offers] Proveedor conectado a sala');
+    logger.info({ providerId, socketId: socket.id }, '[WS /offers] Proveedor conectado');
   });
 
   const bookingsNsp = io.of('/bookings');
@@ -210,9 +473,6 @@ async function bootstrap() {
     );
   });
 
-  // ==========================================
-  // MIDDLEWARE DE AUTENTICACIÓN REST
-  // ==========================================
   const requireAuth = (req: Request, res: Response, next: NextFunction) => {
     const header = req.headers.authorization;
     if (!header?.startsWith('Bearer ')) {
@@ -238,10 +498,8 @@ async function bootstrap() {
 
   const v1 = express.Router();
 
-  // 1. HEALTHCHECK
   v1.get('/health', createHealthHandler(db, redis));
 
-  // 2. AUTENTICACIÓN PASSWORDLESS (OTP) + SESIÓN + REFRESH
   const handleOtpSend = async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { phone } = req.body || {};
@@ -253,14 +511,29 @@ async function bootstrap() {
           timestamp: new Date().toISOString(),
         });
       }
-      // En producción: 6 dígitos criptográficos aleatorios.
-      // En staging/dev: permite variable STAGE_FIXED_OTP o '123456' para pruebas E2E.
+
+      const clientIp =
+        (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || 'unknown';
+      const ipKey = `ratelimit:otp_send:${clientIp}`;
+      const ipCount = await redis.incr(ipKey);
+      if (ipCount === 1) await redis.expire(ipKey, 900);
+      if (!IS_STAGING_OR_DEV && ipCount > 15) {
+        return res.status(429).json({
+          statusCode: 429,
+          errorCode: 'TOO_MANY_OTP_REQUESTS',
+          message: 'Demasiadas solicitudes. Espera 15 minutos.',
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       const otpCode = IS_STAGING_OR_DEV
         ? process.env.STAGE_FIXED_OTP || '123456'
         : String(randomInt(100000, 1000000));
-      await redis.set(`otp:${phone}`, otpCode, 'EX', 300);
 
-      logger.info({ phone, env: process.env.NODE_ENV }, '[Auth] OTP generado y almacenado en Redis');
+      await redis.set(`otp:${phone}`, otpCode, 'EX', 300);
+      await redis.del(`otp_attempts:${phone}`);
+
+      logger.info({ phone, env: process.env.NODE_ENV }, '[Auth] OTP generado');
       return res.status(200).json({
         retryAfterSeconds: 60,
         expiresAt: new Date(Date.now() + 300_000).toISOString(),
@@ -271,7 +544,7 @@ async function bootstrap() {
   };
 
   v1.post('/auth/otp/send', handleOtpSend);
-  v1.post('/auth/otp/request', handleOtpSend); // Alias de compatibilidad
+  v1.post('/auth/otp/request', handleOtpSend);
 
   v1.post('/auth/otp/verify', async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -285,11 +558,23 @@ async function bootstrap() {
         });
       }
 
-      const storedOtp = await redis.get(`otp:${phone}`);
+      const attemptsKey = `otp_attempts:${phone}`;
+      const attempts = await redis.incr(attemptsKey);
+      if (attempts === 1) await redis.expire(attemptsKey, 300);
+      if (attempts > 5) {
+        await redis.del(`otp:${phone}`);
+        return res.status(429).json({
+          statusCode: 429,
+          errorCode: 'OTP_MAX_ATTEMPTS_EXCEEDED',
+          message: 'Máximo de 5 intentos superado. Solicita un nuevo código.',
+          timestamp: new Date().toISOString(),
+        });
+      }
 
-      // BLOQUEO DE SEGURIDAD: El bypass '123456' SOLO se evalúa si IS_STAGING_OR_DEV es true
+      const storedOtp = await redis.get(`otp:${phone}`);
       const isValidOtp =
-        (storedOtp !== null && storedOtp === code) || (IS_STAGING_OR_DEV && code === '123456');
+        (storedOtp !== null && storedOtp === code) ||
+        (IS_STAGING_OR_DEV && code === '123456');
 
       if (!isValidOtp) {
         return res.status(401).json({
@@ -299,10 +584,9 @@ async function bootstrap() {
           timestamp: new Date().toISOString(),
         });
       }
-      await redis.del(`otp:${phone}`);
 
-      // En PRODUCCIÓN todo usuario nuevo nace siempre como 'UNVERIFIED'.
-      // Solo en STAGING/DEV se auto-verifica para la prueba de latencia (salvo sufijo '0000').
+      await redis.del(`otp:${phone}`, attemptsKey);
+
       const initialKycStatus = IS_STAGING_OR_DEV
         ? phone.endsWith('0000')
           ? 'PENDING_VERIFICATION'
@@ -325,7 +609,6 @@ async function bootstrap() {
       );
 
       const user = upsertRes.rows[0];
-      // Auto-suscripción a categorías solo en Staging/Dev para agilizar la prueba de radio
       if (IS_STAGING_OR_DEV && (user.activeRole === 'PROVIDER' || user.activeRole === 'DUAL')) {
         await db.query(
           `INSERT INTO provider_services (provider_id, category_id)
@@ -350,12 +633,7 @@ async function bootstrap() {
       const refreshToken = `rt_chapus_${randomBytes(32).toString('hex')}`;
       await redis.set(`refresh_token:${refreshToken}`, user.id, 'EX', 60 * 60 * 24 * 30);
 
-      return res.status(200).json({
-        accessToken,
-        refreshToken,
-        expiresIn,
-        user,
-      });
+      return res.status(200).json({ accessToken, refreshToken, expiresIn, user });
     } catch (err) {
       return next(err);
     }
@@ -420,12 +698,7 @@ async function bootstrap() {
       const newRefreshToken = `rt_chapus_${randomBytes(32).toString('hex')}`;
       await redis.set(`refresh_token:${newRefreshToken}`, user.id, 'EX', 60 * 60 * 24 * 30);
 
-      return res.status(200).json({
-        accessToken,
-        refreshToken: newRefreshToken,
-        expiresIn,
-        user,
-      });
+      return res.status(200).json({ accessToken, refreshToken, expiresIn, user });
     } catch (err) {
       return next(err);
     }
@@ -456,14 +729,178 @@ async function bootstrap() {
     }
   });
 
-  // 3. CATÁLOGO
+  // CORRECCIÓN #3 y #7: KYC simulado restringido a staging/dev y esquema chapuspro:// por defecto
+  v1.post(
+    '/auth/kyc/stripe-onboarding',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const userId = (req as any).user.sub;
+        const {
+          returnUrl = 'chapuspro://kyc/return',
+          refreshUrl = 'chapuspro://kyc/refresh',
+        } = req.body || {};
+
+        const userRes = await db.query(
+          `SELECT email, phone, stripe_account_id FROM users WHERE id = $1`,
+          [userId]
+        );
+        if (userRes.rowCount === 0) {
+          return res.status(404).json({
+            statusCode: 404,
+            errorCode: 'USER_NOT_FOUND',
+            message: 'Usuario no encontrado.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        let stripeAccountId: string | null = userRes.rows[0].stripe_account_id;
+
+        if (!stripe) {
+          if (!IS_STAGING_OR_DEV) {
+            return res.status(503).json({
+              statusCode: 503,
+              errorCode: 'STRIPE_KYC_UNAVAILABLE',
+              message: 'El servicio de verificación KYC no está configurado.',
+              timestamp: new Date().toISOString(),
+            });
+          }
+          stripeAccountId = stripeAccountId || `acct_staging_${userId.slice(0, 8)}`;
+          await db.query(
+            `UPDATE users SET stripe_account_id = $1, kyc_status = 'VERIFIED' WHERE id = $2`,
+            [stripeAccountId, userId]
+          );
+          return res.status(200).json({
+            onboardingUrl: `${returnUrl}?kyc=simulated_verified`,
+            stripeAccountId,
+          });
+        }
+
+        if (!stripeAccountId) {
+          const account = await stripe.accounts.create({
+            type: 'express',
+            country: 'ES',
+            email: userRes.rows[0].email || undefined,
+            business_type: 'individual',
+            capabilities: {
+              transfers: { requested: true },
+              card_payments: { requested: true },
+            },
+            metadata: { chapusUserId: userId },
+          });
+          stripeAccountId = account.id;
+          await db.query(
+            `UPDATE users SET stripe_account_id = $1, kyc_status = 'PENDING_VERIFICATION' WHERE id = $2`,
+            [stripeAccountId, userId]
+          );
+        }
+
+        const link = await stripe.accountLinks.create({
+          account: stripeAccountId,
+          refresh_url: refreshUrl,
+          return_url: returnUrl,
+          type: 'account_onboarding',
+          collect: 'eventually_due',
+        });
+
+        return res.status(200).json({
+          onboardingUrl: link.url,
+          stripeAccountId,
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  v1.post(
+    '/uploads/presign',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const userId = (req as any).user.sub;
+        const {
+          contentType = 'image/jpeg',
+          fileSizeBytes = 1024,
+          purpose = 'ISSUE_ATTACHMENT',
+        } = req.body || {};
+
+        const allowedExt: Record<string, string> = {
+          'image/jpeg': 'jpg',
+          'image/png': 'png',
+          'image/webp': 'webp',
+          'video/mp4': 'mp4',
+        };
+        const ext = allowedExt[contentType];
+        if (!ext) {
+          return res.status(400).json({
+            statusCode: 400,
+            errorCode: 'UNSUPPORTED_MEDIA_TYPE',
+            message: 'Formato de archivo no soportado.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        const now = new Date();
+        const fileKey = `${String(purpose).toLowerCase()}/${now.getUTCFullYear()}/${String(
+          now.getUTCMonth() + 1
+        ).padStart(2, '0')}/${userId}-${randomBytes(8).toString('hex')}.${ext}`;
+
+        if (!process.env.STORAGE_ACCESS_KEY || !process.env.STORAGE_SECRET_KEY) {
+          if (!IS_STAGING_OR_DEV) {
+            return res.status(503).json({
+              statusCode: 503,
+              errorCode: 'STORAGE_UNAVAILABLE',
+              message: 'Almacenamiento de objetos no configurado.',
+              timestamp: new Date().toISOString(),
+            });
+          }
+          const hostUrl = `${req.protocol}://${req.get('host')}`;
+          return res.status(201).json({
+            uploadUrl: `${hostUrl}/v1/uploads/stub/${fileKey}`,
+            publicFileUrl: `https://placehold.co/800x600/png?text=Chapus+Attachment`,
+            fileKey,
+            expiresInSeconds: 300,
+            requiredHeaders: { 'Content-Type': contentType },
+          });
+        }
+
+        const cdnBase = process.env.STORAGE_CDN_URL || 'https://cdn-staging.chapus.es';
+        const s3 = new S3Client({
+          region: process.env.AWS_REGION || 'eu-south-2',
+          endpoint: process.env.STORAGE_ENDPOINT || undefined,
+          credentials: {
+            accessKeyId: process.env.STORAGE_ACCESS_KEY,
+            secretAccessKey: process.env.STORAGE_SECRET_KEY,
+          },
+        });
+
+        const cmd = new PutObjectCommand({
+          Bucket: process.env.STORAGE_BUCKET_NAME || 'chapus-staging-eu-south-2',
+          Key: fileKey,
+          ContentType: contentType,
+          ContentLength: Number(fileSizeBytes),
+        });
+
+        const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 300 });
+        return res.status(201).json({
+          uploadUrl,
+          publicFileUrl: `${cdnBase}/${fileKey}`,
+          fileKey,
+          expiresInSeconds: 300,
+          requiredHeaders: { 'Content-Type': contentType },
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
   v1.get('/catalog/categories', async (_req: Request, res: Response, next: NextFunction) => {
     try {
       const { rows } = await db.query(`
         SELECT
-          id,
-          slug,
-          name,
+          id, slug, name,
           allowed_models AS "allowedModels",
           base_fixed_price_eur::float AS "baseFixedPriceEur",
           platform_fee_percent::float AS "platformFeePercent"
@@ -476,7 +913,6 @@ async function bootstrap() {
     }
   });
 
-  // 4. GEOLOCALIZACIÓN (HEARTBEAT POSTGIS + RADAR CERCANO)
   v1.patch(
     '/geo/provider-heartbeat',
     requireAuth,
@@ -557,7 +993,7 @@ async function bootstrap() {
     }
   );
 
-  // 5. SOLICITUDES Y DISPATCHER GEOESPACIAL (DISPARA geo:job_alert Y MIDE ackDeltaMs)
+  // CORRECCIÓN #2: El despacho inmediato sin pago solo es válido en BIDDING o dentro de IS_STAGING_OR_DEV
   v1.post('/requests', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
     try {
       const clientUserId = (req as any).user.sub;
@@ -623,62 +1059,28 @@ async function bootstrap() {
 
       const createdRow: ServiceRequestRow = insertRes.rows[0];
 
-      // Buscar proveedores online y verificados en un radio de 25 km (o conectados al WS en staging)
-      const candidatesRes = await db.query(
-        `SELECT
-           u.id AS "providerId",
-           u.fcm_token AS "fcmToken",
-           COALESCE(
-             ROUND((ST_Distance(u.last_location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) / 1000)::numeric, 2)::float,
-             1.2
-           ) AS "distanceKm"
-         FROM users u
-         WHERE u.role IN ('PROVIDER', 'DUAL')
-           AND u.is_online = TRUE
-           AND u.kyc_status = 'VERIFIED'
-           AND u.id <> $3
-           AND (
-             u.last_location IS NULL
-             OR ST_DWithin(
-               u.last_location,
-               ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-               u.service_radius_km * 1000
-             )
-           )
-         LIMIT 25`,
-        [Number(location.lng), Number(location.lat), clientUserId]
-      );
+      const paymentSheet =
+        pricingModel === 'FAST_MATCH'
+          ? await createPaymentSheetPayload(
+              db,
+              clientUserId,
+              createdRow.id,
+              Number(offeredPriceEur || 65.0)
+            )
+          : null;
 
-      // Guardar candidatos en Redis para poder emitir geo:job_taken cuando uno acepte
-      if (candidatesRes.rows.length > 0) {
-        await redis.sadd(
-          `notified_providers:${createdRow.id}`,
-          ...candidatesRes.rows.map((c: any) => c.providerId)
+      const allowImmediateStagingBypass =
+        IS_STAGING_OR_DEV &&
+        (!stripe || req.headers['x-chapus-immediate-dispatch'] === 'true');
+
+      if (pricingModel === 'BIDDING' || allowImmediateStagingBypass) {
+        findCandidatesAndDispatch(createdRow).catch((err) =>
+          logger.error({ err: err?.message, requestId: createdRow.id }, '[Dispatcher Error]')
         );
-        await redis.expire(`notified_providers:${createdRow.id}`, 3600);
       }
 
-      // Disparar alerta geoespacial asíncrona (emite geo:job_alert y registra ackDeltaMs en logs)
-      dispatcher
-        .dispatchJobOffer(createdRow, candidatesRes.rows, 1)
-        .catch((err) => logger.error({ err: err?.message, requestId: createdRow.id }, '[Dispatcher Error]'));
-
       const dto = ServiceRequestSerializer.toDTO(createdRow, clientUserId);
-
-      return res.status(201).json({
-        request: dto,
-        paymentSheet:
-          pricingModel === 'FAST_MATCH'
-            ? {
-                paymentIntentClientSecret: `pi_staging_${createdRow.id}_secret_demo`,
-                ephemeralKey: `ek_staging_${createdRow.id}`,
-                customerId: `cus_staging_${clientUserId.slice(0, 8)}`,
-                publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || 'pk_test_chapus_staging',
-                amountEur: Number(offeredPriceEur || 65.0),
-                currency: 'eur',
-              }
-            : null,
-      });
+      return res.status(201).json({ request: dto, paymentSheet });
     } catch (err) {
       return next(err);
     }
@@ -707,7 +1109,6 @@ async function bootstrap() {
     }
   });
 
-  // 6. PRESUPUESTOS (BIDDING)
   v1.get(
     '/requests/:id/bids',
     requireAuth,
@@ -819,7 +1220,106 @@ async function bootstrap() {
     }
   );
 
-  // 7. ACEPTACIÓN ATÓMICA FAST-MATCH (CON TRY/CATCH Y LIBERACIÓN DE LOCK EN CASO DE FALLO DB)
+  v1.post(
+    '/requests/:id/bids/:bidId/accept',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      const clientUserId = (req as any).user.sub;
+      const { id: requestId, bidId } = req.params;
+      const dbClient = await db.connect();
+
+      try {
+        await dbClient.query('BEGIN');
+
+        const reqRes = await dbClient.query(
+          `SELECT client_id, status FROM service_requests WHERE id = $1 FOR UPDATE`,
+          [requestId]
+        );
+        if (reqRes.rowCount === 0) {
+          await dbClient.query('ROLLBACK');
+          return res.status(404).json({
+            statusCode: 404,
+            errorCode: 'NOT_FOUND',
+            message: 'Solicitud no encontrada.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+        if (reqRes.rows[0].client_id !== clientUserId) {
+          await dbClient.query('ROLLBACK');
+          return res.status(403).json({
+            statusCode: 403,
+            errorCode: 'FORBIDDEN',
+            message: 'Solo el cliente creador puede aceptar un presupuesto.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        const bidRes = await dbClient.query(
+          `SELECT id, provider_id, amount::float AS amount FROM bids WHERE id = $1 AND request_id = $2 FOR UPDATE`,
+          [bidId, requestId]
+        );
+        if (bidRes.rowCount === 0) {
+          await dbClient.query('ROLLBACK');
+          return res.status(404).json({
+            statusCode: 404,
+            errorCode: 'BID_NOT_FOUND',
+            message: 'Presupuesto no encontrado.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        const winningBid = bidRes.rows[0];
+
+        await dbClient.query(`UPDATE bids SET status = 'ACCEPTED' WHERE id = $1`, [bidId]);
+        await dbClient.query(
+          `UPDATE bids SET status = 'REJECTED' WHERE request_id = $1 AND id <> $2`,
+          [requestId, bidId]
+        );
+
+        const targetStatus: BookingStatus =
+          stripe || !IS_STAGING_OR_DEV ? 'AWAITING_PAYMENT' : 'ASSIGNED';
+
+        const updateReq = await dbClient.query(
+          `UPDATE service_requests sr
+           SET status = $1,
+               assigned_provider_id = $2,
+               final_agreed_price = $3,
+               accepted_at = NOW(),
+               version = version + 1
+           WHERE sr.id = $4
+           RETURNING ${SELECT_REQUEST_COLUMNS}`,
+          [targetStatus, winningBid.provider_id, winningBid.amount, requestId]
+        );
+
+        await dbClient.query('COMMIT');
+
+        const updatedRow: ServiceRequestRow = updateReq.rows[0];
+        const paymentSheet = await createPaymentSheetPayload(
+          db,
+          clientUserId,
+          requestId,
+          Number(winningBid.amount)
+        );
+
+        broadcaster.emitJobStateTransition(updatedRow, reqRes.rows[0].status);
+
+        if (targetStatus === 'ASSIGNED') {
+          emitBookingAssignedToProvider(updatedRow, 'ESCROW_HELD');
+        }
+
+        return res.status(200).json({
+          request: ServiceRequestSerializer.toDTO(updatedRow, clientUserId),
+          paymentSheet,
+        });
+      } catch (err) {
+        await dbClient.query('ROLLBACK');
+        return next(err);
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
   v1.post(
     '/requests/:id/fast-accept',
     requireAuth,
@@ -876,10 +1376,9 @@ async function bootstrap() {
 
         const row: ServiceRequestRow = updateRes.rows[0];
 
-        // Emitir job:updated a Cliente y Proveedor con sus vistas RGPD correspondientes
         broadcaster.emitJobStateTransition(row, 'OPEN');
+        emitBookingAssignedToProvider(row, 'ESCROW_HELD');
 
-        // Emitir geo:job_taken a los demás proveedores que recibieron la alerta
         const notifiedProviders = await redis.smembers(`notified_providers:${requestId}`);
         const losingRooms = notifiedProviders
           .filter((id) => id !== user.sub)
@@ -902,9 +1401,207 @@ async function bootstrap() {
     }
   );
 
+  v1.post(
+    '/requests/:id/start',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const userId = (req as any).user.sub;
+        const requestId = req.params.id;
+
+        const updateRes = await db.query(
+          `UPDATE service_requests sr
+           SET status = 'IN_PROGRESS',
+               version = version + 1
+           WHERE sr.id = $1
+             AND sr.assigned_provider_id = $2
+             AND sr.status = 'ASSIGNED'
+           RETURNING ${SELECT_REQUEST_COLUMNS}`,
+          [requestId, userId]
+        );
+
+        if (updateRes.rowCount === 0) {
+          return res.status(409).json({
+            statusCode: 409,
+            errorCode: 'INVALID_STATE_TRANSITION',
+            message: 'Solo el profesional asignado puede iniciar un servicio en estado ASSIGNED.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        const row: ServiceRequestRow = updateRes.rows[0];
+        broadcaster.emitJobStateTransition(row, 'ASSIGNED');
+
+        return res.status(200).json(ServiceRequestSerializer.toDTO(row, userId));
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  // CORRECCIÓN #5: Captura el PaymentIntent manual y ejecuta el Split Transfer al completar el trabajo
+  v1.post(
+    '/requests/:id/complete',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const userId = (req as any).user.sub;
+        const requestId = req.params.id;
+
+        const checkRes = await db.query(
+          `SELECT client_id, assigned_provider_id, status, final_agreed_price
+           FROM service_requests WHERE id = $1`,
+          [requestId]
+        );
+        if (checkRes.rowCount === 0) {
+          return res.status(404).json({
+            statusCode: 404,
+            errorCode: 'NOT_FOUND',
+            message: 'Solicitud no encontrada.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        const current = checkRes.rows[0];
+        if (current.client_id !== userId && current.assigned_provider_id !== userId) {
+          return res.status(403).json({
+            statusCode: 403,
+            errorCode: 'FORBIDDEN',
+            message: 'No estás autorizado para completar este servicio.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        if (!['ASSIGNED', 'IN_PROGRESS'].includes(current.status)) {
+          return res.status(409).json({
+            statusCode: 409,
+            errorCode: 'INVALID_STATE_TRANSITION',
+            message: `No se puede completar un servicio en estado ${current.status}.`,
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        if (stripe && current.assigned_provider_id) {
+          const payRes = await db.query(
+            `SELECT p.stripe_payment_intent_id, p.provider_payout::float AS payout, u.stripe_account_id
+             FROM payments p
+             JOIN users u ON u.id = $2
+             WHERE p.request_id = $1`,
+            [requestId, current.assigned_provider_id]
+          );
+
+          if (payRes.rowCount && payRes.rowCount > 0) {
+            const { stripe_payment_intent_id, payout, stripe_account_id } = payRes.rows[0];
+            if (stripe_payment_intent_id && !stripe_payment_intent_id.startsWith('pi_staging_')) {
+              const capturedPi = await stripe.paymentIntents.capture(stripe_payment_intent_id);
+              let transferId: string | null = null;
+
+              if (
+                stripe_account_id &&
+                !stripe_account_id.startsWith('acct_staging_') &&
+                capturedPi.latest_charge
+              ) {
+                const transfer = await stripe.transfers.create(
+                  {
+                    amount: Math.round(Number(payout) * 100),
+                    currency: 'eur',
+                    destination: stripe_account_id,
+                    transfer_group: `CHAPUS_REQ_${requestId}`,
+                    source_transaction: capturedPi.latest_charge as string,
+                  },
+                  { idempotencyKey: `transfer_${requestId}` }
+                );
+                transferId = transfer.id;
+              }
+
+              await db.query(
+                `UPDATE payments
+                 SET status = 'RELEASED',
+                     provider_id = $1,
+                     stripe_transfer_id = COALESCE($2, stripe_transfer_id),
+                     released_at = NOW()
+                 WHERE request_id = $3`,
+                [current.assigned_provider_id, transferId, requestId]
+              );
+            }
+          }
+        }
+
+        const updateRes = await db.query(
+          `UPDATE service_requests sr
+           SET status = 'COMPLETED',
+               completed_at = NOW(),
+               version = version + 1
+           WHERE sr.id = $1
+           RETURNING ${SELECT_REQUEST_COLUMNS}`,
+          [requestId]
+        );
+
+        const row: ServiceRequestRow = updateRes.rows[0];
+
+        if (row.assigned_provider_id) {
+          await db.query(
+            `UPDATE users SET completed_jobs_count = completed_jobs_count + 1 WHERE id = $1`,
+            [row.assigned_provider_id]
+          );
+        }
+
+        broadcaster.emitJobStateTransition(row, current.status);
+        return res.status(200).json(ServiceRequestSerializer.toDTO(row, userId));
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  // CORRECCIÓN #4: Exige IS_STAGING_OR_DEV + validación en tiempo constante de x-admin-secret
+  v1.post(
+    '/admin/cleanup-staging',
+    async (req: Request, res: Response, next: NextFunction) => {
+      if (!IS_STAGING_OR_DEV) {
+        return res.status(403).json({
+          statusCode: 403,
+          errorCode: 'FORBIDDEN_IN_PROD',
+          message: 'Operación permitida únicamente en staging.',
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const expectedSecret = process.env.ADMIN_CLEANUP_SECRET || JWT_SECRET;
+      const providedSecret = String(req.headers['x-admin-secret'] || '');
+      const bufExpected = Buffer.from(expectedSecret);
+      const bufProvided = Buffer.from(providedSecret);
+
+      if (
+        bufExpected.length !== bufProvided.length ||
+        !timingSafeEqual(bufExpected, bufProvided)
+      ) {
+        return res.status(401).json({
+          statusCode: 401,
+          errorCode: 'UNAUTHORIZED_ADMIN',
+          message: 'Cabecera x-admin-secret inválida o ausente.',
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      try {
+        const delRes = await db.query(`
+          DELETE FROM service_requests
+          WHERE status = 'OPEN'
+            AND client_id IN (SELECT id FROM users WHERE phone = '+34600000902')
+        `);
+        return res.status(200).json({
+          cleanedOpenRequestsCount: delRes.rowCount || 0,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
   app.use('/v1', v1);
 
-  // Manejador global de errores (incluyendo excepciones 403 del Serializador RGPD)
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const statusCode = typeof err?.statusCode === 'number' ? err.statusCode : 500;
     const errorCode = err?.errorCode || (statusCode === 500 ? 'INTERNAL_SERVER_ERROR' : 'ERROR');
