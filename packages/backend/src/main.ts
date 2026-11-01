@@ -2,7 +2,8 @@ import http from 'http';
 import { randomBytes, randomInt, timingSafeEqual } from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import { Server as SocketServer } from 'socket.io';
-import { Pool } from 'pg';
+import { createAdapter } from '@socket.io/redis-adapter';
+import { Pool, PoolClient } from 'pg';
 import { Redis } from 'ioredis';
 import jwt from 'jsonwebtoken';
 import * as admin from 'firebase-admin';
@@ -114,7 +115,7 @@ async function seedDefaultCategories(db: Pool) {
 }
 
 async function createPaymentSheetPayload(
-  db: Pool,
+  dbOrClient: Pool | PoolClient,
   userId: string,
   requestId: string,
   amountEur: number
@@ -137,7 +138,7 @@ async function createPaymentSheetPayload(
   }
 
   const amountCents = Math.round(amountEur * 100);
-  const userRes = await db.query(
+  const userRes = await dbOrClient.query(
     `SELECT email, phone, full_name, stripe_customer_id FROM users WHERE id = $1`,
     [userId]
   );
@@ -150,7 +151,10 @@ async function createPaymentSheetPayload(
       metadata: { chapusUserId: userId },
     });
     customerId = customer.id;
-    await db.query(`UPDATE users SET stripe_customer_id = $1 WHERE id = $2`, [customerId, userId]);
+    await dbOrClient.query(`UPDATE users SET stripe_customer_id = $1 WHERE id = $2`, [
+      customerId,
+      userId,
+    ]);
   }
 
   const ephemeralKey = await stripe.ephemeralKeys.create(
@@ -158,7 +162,6 @@ async function createPaymentSheetPayload(
     { apiVersion: '2024-06-20' }
   );
 
-  // CORRECCIÓN #5: capture_method: 'manual' para retener fondos en Escrow sin capturarlos aún
   const paymentIntent = await stripe.paymentIntents.create(
     {
       amount: amountCents,
@@ -175,7 +178,7 @@ async function createPaymentSheetPayload(
   const feeEur = Number((amountEur * 0.15).toFixed(2));
   const netEur = Number((amountEur - feeEur).toFixed(2));
 
-  await db.query(
+  await dbOrClient.query(
     `INSERT INTO payments (
        request_id, client_id, stripe_payment_intent_id,
        total_amount, platform_fee, provider_payout, status
@@ -209,9 +212,10 @@ async function bootstrap() {
     max: 20,
   });
 
-  const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-    maxRetriesPerRequest: 3,
-  });
+  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+  const redis = new Redis(redisUrl, { maxRetriesPerRequest: 3 });
+  const redisPub = redis.duplicate();
+  const redisSub = redis.duplicate();
 
   const logger = {
     info: (obj: object, msg: string) =>
@@ -226,10 +230,14 @@ async function bootstrap() {
   await seedDefaultCategories(db);
 
   const app = express();
+  // FALLO 1.6 CORREGIDO: Confiar en el proxy inverso de Render para HTTPS en /uploads/presign y rate-limiting
+  app.set('trust proxy', 1);
+
   const httpServer = http.createServer(app);
   const io = new SocketServer(httpServer, {
     cors: { origin: '*', methods: ['GET', 'POST', 'PATCH', 'PUT'] },
     transports: ['websocket', 'polling'],
+    adapter: createAdapter(redisPub, redisSub),
   });
 
   const broadcaster = new JobStateBroadcaster(io);
@@ -273,7 +281,7 @@ async function bootstrap() {
     await dispatcher.dispatchJobOffer(row, candidatesRes.rows, 1);
   }
 
-  // CORRECCIÓN #6: Incluye la clave `job` que espera Chapus Pro (y `request` por compatibilidad)
+  // DECISIÓN 2.3: Se elimina el alias legacy `request` y se envía únicamente `job`
   function emitBookingAssignedToProvider(row: ServiceRequestRow, escrowStatus: string = 'ESCROW_HELD') {
     if (!row.assigned_provider_id) return;
     const unmaskedProviderDto = ServiceRequestSerializer.toDTO(row, row.assigned_provider_id);
@@ -284,14 +292,13 @@ async function bootstrap() {
       .to(`provider:${row.assigned_provider_id}`)
       .emit('booking:assigned', {
         job: unmaskedProviderDto,
-        request: unmaskedProviderDto,
         escrowStatus,
         guaranteedPayoutEur,
         assignedAt: new Date().toISOString(),
       });
   }
 
-  // CORRECCIÓN #1 y #5: Webhook con firma obligatoria y soporte para amount_capturable_updated
+  // FALLO 1.1 CORREGIDO: El webhook solo transiciona pagos en REQUIRES_CAPTURE, nunca pisa RELEASED
   app.post(
     '/v1/webhooks/stripe',
     express.raw({ type: 'application/json' }),
@@ -341,27 +348,34 @@ async function bootstrap() {
           const pi = event.data.object as Stripe.PaymentIntent;
           const requestId = pi.metadata?.requestId;
           if (requestId) {
-            await db.query(
-              `UPDATE payments SET status = 'ESCROW_HELD', captured_at = NOW() WHERE stripe_payment_intent_id = $1`,
+            const payUpdate = await db.query(
+              `UPDATE payments
+               SET status = 'ESCROW_HELD',
+                   captured_at = COALESCE(captured_at, NOW())
+               WHERE stripe_payment_intent_id = $1
+                 AND status = 'REQUIRES_CAPTURE'`,
               [pi.id]
             );
 
-            const reqRes = await db.query(
-              `UPDATE service_requests sr
-               SET status = CASE WHEN sr.status = 'AWAITING_PAYMENT' THEN 'ASSIGNED'::request_status ELSE sr.status END,
-                   version = sr.version + 1
-               WHERE sr.id = $1
-               RETURNING ${SELECT_REQUEST_COLUMNS}`,
-              [requestId]
-            );
+            if (payUpdate.rowCount && payUpdate.rowCount > 0) {
+              const reqRes = await db.query(
+                `UPDATE service_requests sr
+                 SET status = CASE WHEN sr.status = 'AWAITING_PAYMENT' THEN 'ASSIGNED'::request_status ELSE sr.status END,
+                     version = CASE WHEN sr.status = 'AWAITING_PAYMENT' THEN sr.version + 1 ELSE sr.version END
+                 WHERE sr.id = $1
+                   AND sr.status IN ('OPEN', 'AWAITING_PAYMENT')
+                 RETURNING ${SELECT_REQUEST_COLUMNS}`,
+                [requestId]
+              );
 
-            if (reqRes.rowCount && reqRes.rowCount > 0) {
-              const row: ServiceRequestRow = reqRes.rows[0];
-              if (row.assigned_provider_id && row.status === 'ASSIGNED') {
-                broadcaster.emitJobStateTransition(row, 'AWAITING_PAYMENT');
-                emitBookingAssignedToProvider(row, 'ESCROW_HELD');
-              } else if (row.status === 'OPEN' && row.pricing_model === 'FAST_MATCH') {
-                await findCandidatesAndDispatch(row);
+              if (reqRes.rowCount && reqRes.rowCount > 0) {
+                const row: ServiceRequestRow = reqRes.rows[0];
+                if (row.assigned_provider_id && row.status === 'ASSIGNED') {
+                  broadcaster.emitJobStateTransition(row, 'AWAITING_PAYMENT');
+                  emitBookingAssignedToProvider(row, 'ESCROW_HELD');
+                } else if (row.status === 'OPEN' && row.pricing_model === 'FAST_MATCH') {
+                  await findCandidatesAndDispatch(row);
+                }
               }
             }
           }
@@ -374,14 +388,16 @@ async function bootstrap() {
     }
   );
 
-  // Endpoint PUT binario para recibir fotos cuando S3 no está configurado en Staging
-  app.put(
-    '/v1/uploads/stub/*',
-    express.raw({ type: '*/*', limit: '15mb' }),
-    (_req: Request, res: Response) => {
-      return res.status(200).send();
-    }
-  );
+  // FALLO 1.4 CORREGIDO: Stub de subida restringido estrictamente a IS_STAGING_OR_DEV
+  if (IS_STAGING_OR_DEV) {
+    app.put(
+      '/v1/uploads/stub/*',
+      express.raw({ type: '*/*', limit: '15mb' }),
+      (_req: Request, res: Response) => {
+        return res.status(200).send();
+      }
+    );
+  }
 
   app.use(express.json({ limit: '2mb' }));
 
@@ -512,8 +528,7 @@ async function bootstrap() {
         });
       }
 
-      const clientIp =
-        (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || 'unknown';
+      const clientIp = req.ip || 'unknown';
       const ipKey = `ratelimit:otp_send:${clientIp}`;
       const ipCount = await redis.incr(ipKey);
       if (ipCount === 1) await redis.expire(ipKey, 900);
@@ -729,7 +744,6 @@ async function bootstrap() {
     }
   });
 
-  // CORRECCIÓN #3 y #7: KYC simulado restringido a staging/dev y esquema chapuspro:// por defecto
   v1.post(
     '/auth/kyc/stripe-onboarding',
     requireAuth,
@@ -776,7 +790,7 @@ async function bootstrap() {
           });
         }
 
-        if (!stripeAccountId) {
+        if (!stripeAccountId || stripeAccountId.startsWith('acct_staging_')) {
           const account = await stripe.accounts.create({
             type: 'express',
             country: 'ES',
@@ -813,6 +827,7 @@ async function bootstrap() {
     }
   );
 
+  // FALLO 1.6 CORREGIDO: /uploads/presign devuelve https:// detrás de Render
   v1.post(
     '/uploads/presign',
     requireAuth,
@@ -855,7 +870,9 @@ async function bootstrap() {
               timestamp: new Date().toISOString(),
             });
           }
-          const hostUrl = `${req.protocol}://${req.get('host')}`;
+          const forwardedProto = (req.headers['x-forwarded-proto'] as string)?.split(',')[0]?.trim();
+          const proto = forwardedProto || req.protocol || 'https';
+          const hostUrl = `${proto}://${req.get('host')}`;
           return res.status(201).json({
             uploadUrl: `${hostUrl}/v1/uploads/stub/${fileKey}`,
             publicFileUrl: `https://placehold.co/800x600/png?text=Chapus+Attachment`,
@@ -993,30 +1010,33 @@ async function bootstrap() {
     }
   );
 
-  // CORRECCIÓN #2: El despacho inmediato sin pago solo es válido en BIDDING o dentro de IS_STAGING_OR_DEV
+  // FALLO 1.5 CORREGIDO: Transacción atómica en POST /requests (si Stripe falla, hace ROLLBACK)
   v1.post('/requests', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const clientUserId = (req as any).user.sub;
-      const {
-        categoryId,
-        pricingModel,
-        offeredPriceEur = null,
-        location,
-        addressText,
-        approximateZone,
-        description,
-        photoUrls = [],
-        scheduledAt = null,
-      } = req.body || {};
+    const clientUserId = (req as any).user.sub;
+    const {
+      categoryId,
+      pricingModel,
+      offeredPriceEur = null,
+      location,
+      addressText,
+      approximateZone,
+      description,
+      photoUrls = [],
+      scheduledAt = null,
+    } = req.body || {};
 
-      if (!categoryId || !pricingModel || !location || !addressText || !description) {
-        return res.status(400).json({
-          statusCode: 400,
-          errorCode: 'VALIDATION_ERROR',
-          message: 'Faltan campos obligatorios para crear la solicitud.',
-          timestamp: new Date().toISOString(),
-        });
-      }
+    if (!categoryId || !pricingModel || !location || !addressText || !description) {
+      return res.status(400).json({
+        statusCode: 400,
+        errorCode: 'VALIDATION_ERROR',
+        message: 'Faltan campos obligatorios para crear la solicitud.',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const dbClient = await db.connect();
+    try {
+      await dbClient.query('BEGIN');
 
       const safeZone = deriveApproximateZone(
         approximateZone,
@@ -1025,7 +1045,7 @@ async function bootstrap() {
         Number(location.lng)
       );
 
-      const insertRes = await db.query(
+      const insertRes = await dbClient.query(
         `INSERT INTO service_requests (
            client_id, category_id, pricing_model, offered_price,
            location, address_text, approximate_zone, description, photo_urls, scheduled_at
@@ -1062,12 +1082,14 @@ async function bootstrap() {
       const paymentSheet =
         pricingModel === 'FAST_MATCH'
           ? await createPaymentSheetPayload(
-              db,
+              dbClient,
               clientUserId,
               createdRow.id,
               Number(offeredPriceEur || 65.0)
             )
           : null;
+
+      await dbClient.query('COMMIT');
 
       const allowImmediateStagingBypass =
         IS_STAGING_OR_DEV &&
@@ -1082,7 +1104,10 @@ async function bootstrap() {
       const dto = ServiceRequestSerializer.toDTO(createdRow, clientUserId);
       return res.status(201).json({ request: dto, paymentSheet });
     } catch (err) {
+      await dbClient.query('ROLLBACK');
       return next(err);
+    } finally {
+      dbClient.release();
     }
   });
 
@@ -1220,6 +1245,7 @@ async function bootstrap() {
     }
   );
 
+  // FALLOS 1.2 y 1.5 CORREGIDOS: Exige status = 'OPEN', pricing_model = 'BIDDING' y crea PaymentIntent antes del COMMIT
   v1.post(
     '/requests/:id/bids/:bidId/accept',
     requireAuth,
@@ -1232,7 +1258,7 @@ async function bootstrap() {
         await dbClient.query('BEGIN');
 
         const reqRes = await dbClient.query(
-          `SELECT client_id, status FROM service_requests WHERE id = $1 FOR UPDATE`,
+          `SELECT client_id, status, pricing_model FROM service_requests WHERE id = $1 FOR UPDATE`,
           [requestId]
         );
         if (reqRes.rowCount === 0) {
@@ -1253,9 +1279,21 @@ async function bootstrap() {
             timestamp: new Date().toISOString(),
           });
         }
+        if (reqRes.rows[0].status !== 'OPEN' || reqRes.rows[0].pricing_model !== 'BIDDING') {
+          await dbClient.query('ROLLBACK');
+          return res.status(409).json({
+            statusCode: 409,
+            errorCode: 'INVALID_REQUEST_STATE',
+            message: `La solicitud ya no admite aceptar presupuestos (estado actual: ${reqRes.rows[0].status}).`,
+            timestamp: new Date().toISOString(),
+          });
+        }
 
         const bidRes = await dbClient.query(
-          `SELECT id, provider_id, amount::float AS amount FROM bids WHERE id = $1 AND request_id = $2 FOR UPDATE`,
+          `SELECT id, provider_id, amount::float AS amount, status
+           FROM bids
+           WHERE id = $1 AND request_id = $2
+           FOR UPDATE`,
           [bidId, requestId]
         );
         if (bidRes.rowCount === 0) {
@@ -1267,8 +1305,25 @@ async function bootstrap() {
             timestamp: new Date().toISOString(),
           });
         }
+        if (bidRes.rows[0].status !== 'PENDING') {
+          await dbClient.query('ROLLBACK');
+          return res.status(409).json({
+            statusCode: 409,
+            errorCode: 'BID_NOT_PENDING',
+            message: `El presupuesto ya no está pendiente (estado: ${bidRes.rows[0].status}).`,
+            timestamp: new Date().toISOString(),
+          });
+        }
 
         const winningBid = bidRes.rows[0];
+
+        // Se crea el PaymentIntent ANTES de confirmar los cambios; si Stripe falla, salta al catch y hace ROLLBACK
+        const paymentSheet = await createPaymentSheetPayload(
+          dbClient,
+          clientUserId,
+          requestId,
+          Number(winningBid.amount)
+        );
 
         await dbClient.query(`UPDATE bids SET status = 'ACCEPTED' WHERE id = $1`, [bidId]);
         await dbClient.query(
@@ -1287,6 +1342,7 @@ async function bootstrap() {
                accepted_at = NOW(),
                version = version + 1
            WHERE sr.id = $4
+             AND sr.status = 'OPEN'
            RETURNING ${SELECT_REQUEST_COLUMNS}`,
           [targetStatus, winningBid.provider_id, winningBid.amount, requestId]
         );
@@ -1294,14 +1350,7 @@ async function bootstrap() {
         await dbClient.query('COMMIT');
 
         const updatedRow: ServiceRequestRow = updateReq.rows[0];
-        const paymentSheet = await createPaymentSheetPayload(
-          db,
-          clientUserId,
-          requestId,
-          Number(winningBid.amount)
-        );
-
-        broadcaster.emitJobStateTransition(updatedRow, reqRes.rows[0].status);
+        broadcaster.emitJobStateTransition(updatedRow, 'OPEN');
 
         if (targetStatus === 'ASSIGNED') {
           emitBookingAssignedToProvider(updatedRow, 'ESCROW_HELD');
@@ -1439,7 +1488,7 @@ async function bootstrap() {
     }
   );
 
-  // CORRECCIÓN #5: Captura el PaymentIntent manual y ejecuta el Split Transfer al completar el trabajo
+  // FALLO 1.3 y DECISIÓN 2.1 CORREGIDOS: Solo el cliente creador (client_id === userId) puede completar y liberar el Escrow
   v1.post(
     '/requests/:id/complete',
     requireAuth,
@@ -1463,11 +1512,11 @@ async function bootstrap() {
         }
 
         const current = checkRes.rows[0];
-        if (current.client_id !== userId && current.assigned_provider_id !== userId) {
+        if (current.client_id !== userId) {
           return res.status(403).json({
             statusCode: 403,
-            errorCode: 'FORBIDDEN',
-            message: 'No estás autorizado para completar este servicio.',
+            errorCode: 'FORBIDDEN_ONLY_CLIENT_CAN_COMPLETE',
+            message: 'Únicamente el cliente titular puede confirmar la finalización y liberar el pago.',
             timestamp: new Date().toISOString(),
           });
         }
@@ -1483,7 +1532,7 @@ async function bootstrap() {
 
         if (stripe && current.assigned_provider_id) {
           const payRes = await db.query(
-            `SELECT p.stripe_payment_intent_id, p.provider_payout::float AS payout, u.stripe_account_id
+            `SELECT p.stripe_payment_intent_id, p.provider_payout::float AS payout, p.status AS pay_status, u.stripe_account_id
              FROM payments p
              JOIN users u ON u.id = $2
              WHERE p.request_id = $1`,
@@ -1491,8 +1540,12 @@ async function bootstrap() {
           );
 
           if (payRes.rowCount && payRes.rowCount > 0) {
-            const { stripe_payment_intent_id, payout, stripe_account_id } = payRes.rows[0];
-            if (stripe_payment_intent_id && !stripe_payment_intent_id.startsWith('pi_staging_')) {
+            const { stripe_payment_intent_id, payout, pay_status, stripe_account_id } = payRes.rows[0];
+            if (
+              stripe_payment_intent_id &&
+              !stripe_payment_intent_id.startsWith('pi_staging_') &&
+              pay_status !== 'RELEASED'
+            ) {
               const capturedPi = await stripe.paymentIntents.capture(stripe_payment_intent_id);
               let transferId: string | null = null;
 
@@ -1554,7 +1607,6 @@ async function bootstrap() {
     }
   );
 
-  // CORRECCIÓN #4: Exige IS_STAGING_OR_DEV + validación en tiempo constante de x-admin-secret
   v1.post(
     '/admin/cleanup-staging',
     async (req: Request, res: Response, next: NextFunction) => {
