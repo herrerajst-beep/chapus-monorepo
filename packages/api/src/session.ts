@@ -22,6 +22,7 @@ export interface SessionState {
 
 /** Margen para renovar antes de que caduque el JWT. */
 const EXPIRY_SKEW_MS = 60_000;
+const HYDRATE_TIMEOUT_MS = 4_000;
 
 /**
  * Sesión passwordless: guarda el par access/refresh y renueva el JWT de forma proactiva.
@@ -78,8 +79,20 @@ export function createSessionStore(opts: {
     signOut,
     refreshNow,
     hydrate: async () => {
-      const raw = await opts.storage.get(opts.storageKey).catch(() => null);
-      const s = raw ? (JSON.parse(raw) as StoredSession) : null;
+      // Si el almacenamiento seguro no responde o guarda algo corrupto, se arranca sin sesión:
+      // quedarse en 'loading' deja la app en blanco sin ninguna pista.
+      let s: StoredSession | null = null;
+      try {
+        const raw = await Promise.race([
+          opts.storage.get(opts.storageKey),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`sin respuesta en ${HYDRATE_TIMEOUT_MS} ms`)), HYDRATE_TIMEOUT_MS),
+          ),
+        ]);
+        s = raw ? (JSON.parse(raw) as StoredSession) : null;
+      } catch (e) {
+        console.warn('[session] no se pudo leer la sesión guardada:', String(e));
+      }
       store.setState({ session: s, status: s ? 'signedIn' : 'signedOut' });
     },
     getAccessToken: async (): Promise<string | null> => {

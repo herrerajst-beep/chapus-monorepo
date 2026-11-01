@@ -58,15 +58,16 @@ export function createChapusApi({ baseUrl, getToken, onUnauthorized }: ChapusApi
   const pub = createClient<paths>({ baseUrl });
   const http = createClient<paths>({ baseUrl });
 
+  // Los middlewares no devuelven nada: openapi-fetch exige `instanceof Response/Request` a lo
+  // que se devuelve, y en React Native las respuestas vacías (204) no siempre lo cumplen.
+  // Sin valor de retorno conserva el objeto original.
   http.use({
     async onRequest({ request }) {
       const token = await getToken();
       if (token) request.headers.set('Authorization', `Bearer ${token}`);
-      return request;
     },
     onResponse({ response }) {
       if (response.status === 401) onUnauthorized?.();
-      return response;
     },
   });
 

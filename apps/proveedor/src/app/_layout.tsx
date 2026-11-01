@@ -12,6 +12,7 @@ import { FastMatchBanner } from '@/features/alerts/FastMatchBanner';
 import { usePresenceTracking } from '@/features/presence/usePresence';
 import { useJobEvents } from '@/features/jobs/useJobEvents';
 import { loadDeviceId } from '@/lib/device';
+import { stopBackgroundLocation } from '@/features/presence/backgroundLocation';
 
 function Realtime() {
   useJobAlertChannel();
@@ -27,6 +28,10 @@ export default function RootLayout() {
     void session.hydrate();
     void loadDeviceId();
     void setupNotificationChannels();
+    // Al arrancar nadie está «Disponible», así que un seguimiento en segundo plano que siga
+    // registrado de una sesión anterior es huérfano. Si se deja, su tarea headless destruye
+    // el ReactHost al terminar y la interfaz se queda en gris.
+    void stopBackgroundLocation().catch(() => undefined);
   }, []);
 
   if (status === 'loading') return null;
