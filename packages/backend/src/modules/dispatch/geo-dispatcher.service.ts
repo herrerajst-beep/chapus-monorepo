@@ -225,17 +225,39 @@ export class GeoDispatcherService {
   }
 
   private async sendBatchPushFallback(rawRow: ServiceRequestRow, tokens: string[]) {
+    const isFastMatch = rawRow.pricing_model === 'FAST_MATCH';
+    const price = rawRow.offered_price != null ? `${Number(rawRow.offered_price).toFixed(2).replace('.', ',')} €` : null;
+    const zone = String(rawRow.approximate_zone); // Dirección exacta jamás viaja por FCM
+
     await this.fcm.sendEachForMulticast({
       tokens,
+      // Con la app cerrada, Android solo muestra mensajes con bloque `notification`;
+      // un mensaje solo de datos despierta la app pero no enseña nada al profesional.
+      notification: {
+        title: isFastMatch ? `⚡ Trabajo directo${price ? ` · ${price}` : ''}` : '📋 Nueva solicitud de presupuesto',
+        body: `${zone}. Toca para verlo antes que otro profesional.`,
+      },
       data: {
         type: 'NEW_JOB_ALERT',
         requestId: String(rawRow.id),
         pricingModel: String(rawRow.pricing_model),
-        approximateZone: String(rawRow.approximate_zone), // Dirección exacta jamás viaja por FCM
+        approximateZone: zone,
+        ...(rawRow.offered_price != null && { offeredPriceEur: String(rawRow.offered_price) }),
       },
       android: {
         priority: 'high',
         ttl: 45000,
+        notification: {
+          // Canal y sonido que crea la app (chapus_urgent_jobs + urgent_alert.wav).
+          channelId: 'chapus_urgent_jobs',
+          sound: 'urgent_alert',
+          priority: 'max',
+          visibility: 'public',
+        },
+      },
+      apns: {
+        headers: { 'apns-priority': '10', 'apns-push-type': 'alert' },
+        payload: { aps: { sound: 'urgent_alert.wav', 'interruption-level': 'time-sensitive' } },
       },
     });
   }
