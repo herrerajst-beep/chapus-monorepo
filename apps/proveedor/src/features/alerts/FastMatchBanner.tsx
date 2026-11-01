@@ -81,6 +81,9 @@ export function FastMatchBanner() {
 
   return (
     <Animated.View
+      // Remonta por alerta: si llega otra con el banner visible, onLayout vuelve a dispararse
+      // y su tiempo de pintado también se mide.
+      key={id}
       style={[
         styles.wrap,
         { paddingBottom: insets.bottom + space.md, opacity },

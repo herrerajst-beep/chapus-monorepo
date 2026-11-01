@@ -8,6 +8,13 @@ import {
   shouldRetry,
   type SessionState,
 } from '@chapus/api';
+import {
+  DEMO_ENABLED,
+  DEMO_TOKEN_PREFIX,
+  createDemoApi,
+  demoSession,
+  demoUnavailable,
+} from '@/features/demo/demoApi';
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:4000/v1';
 const WS_URL = process.env.EXPO_PUBLIC_WS_URL ?? 'http://localhost:4000';
@@ -20,10 +27,25 @@ export const session = createSessionStore({
 
 export const useSession = <T>(selector: (s: SessionState) => T) => useStore(session.store, selector);
 
-export const api = createChapusApi({
+const httpApi = createChapusApi({
   baseUrl: API_URL,
   getToken: session.getAccessToken,
   onUnauthorized: () => void session.signOut(),
+});
+
+export const isDemoSession = () =>
+  DEMO_ENABLED && (session.store.getState().session?.accessToken.startsWith(DEMO_TOKEN_PREFIX) ?? false);
+
+export const signInDemo = () => session.signIn(demoSession());
+
+const demoApi = createDemoApi();
+
+/** Con sesión demo, las llamadas se resuelven en local y no sale ninguna petición HTTP. */
+export const api = new Proxy(httpApi, {
+  get: (target, prop, receiver) => {
+    if (!isDemoSession()) return Reflect.get(target, prop, receiver);
+    return demoApi[prop as keyof typeof demoApi] ?? demoUnavailable;
+  },
 });
 
 export const offersSocket = createOffersSocket(WS_URL, session.getAccessToken);

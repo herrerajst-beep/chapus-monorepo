@@ -1,7 +1,8 @@
 import { isApiError } from '@chapus/api';
-import { OtpLoginForm } from '@chapus/ui';
-import { api, session } from '@/lib/api';
+import { Button, OtpLoginForm, Text } from '@chapus/ui';
+import { api, session, signInDemo } from '@/lib/api';
 import { getNativePushToken } from '@/features/alerts/notifications';
+import { DEMO_ENABLED } from '@/features/demo/demoApi';
 
 const describeError = (e: unknown, step: 'request' | 'verify') => {
   if (isApiError(e, 429)) return 'Demasiados intentos. Espera un minuto.';
@@ -21,6 +22,16 @@ export default function LoginScreen() {
         const fcmToken = await getNativePushToken().catch(() => null);
         await session.signIn(await api.verifyOtp(phone, code, 'PROVIDER', fcmToken));
       }}
+      footer={
+        DEMO_ENABLED ? (
+          <>
+            <Button tone="neutral" variant="outline" label="Entrar en modo demo" onPress={() => void signInDemo()} />
+            <Text variant="caption" muted>
+              Solo desarrollo: sin backend, con datos y alertas simuladas.
+            </Text>
+          </>
+        ) : null
+      }
     />
   );
 }

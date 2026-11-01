@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { View } from 'react-native';
 import { normalizeSpanishPhone, otpCodeSchema, type OtpChannel } from '@chapus/core';
 import { Button, Field, Screen, Segmented, Text } from './components';
@@ -14,10 +14,20 @@ interface Props {
   onVerify: (phone: string, code: string) => Promise<void>;
   /** Traduce errores del backend (p. ej. ApiError 401/429) a texto para el usuario. */
   describeError: (e: unknown, step: 'request' | 'verify') => string;
+  /** Contenido extra bajo el formulario (p. ej. el acceso al modo demo en desarrollo). */
+  footer?: ReactNode;
 }
 
 /** Login passwordless en dos pasos: teléfono (+34) → código de 6 dígitos. */
-export function OtpLoginForm({ title, subtitle, tone = 'brand', onRequestCode, onVerify, describeError }: Props) {
+export function OtpLoginForm({
+  title,
+  subtitle,
+  tone = 'brand',
+  onRequestCode,
+  onVerify,
+  describeError,
+  footer,
+}: Props) {
   const [phoneInput, setPhoneInput] = useState('');
   const [channel, setChannel] = useState<OtpChannel>('WHATSAPP');
   const [phone, setPhone] = useState<string | null>(null);
@@ -119,6 +129,7 @@ export function OtpLoginForm({ title, subtitle, tone = 'brand', onRequestCode, o
       )}
 
       {error ? <Text style={{ color: palette.danger }}>{error}</Text> : null}
+      {footer}
     </Screen>
   );
 }

@@ -12,9 +12,11 @@ import {
 } from '@/features/presence/usePresence';
 import { DIAGNOSTICS_ENABLED } from '@/features/diagnostics/latency';
 import { useAlerts } from '@/features/alerts/store';
+import { isDemoSession, session, useSession } from '@/lib/api';
 
 export default function RadarScreen() {
   const me = useMe();
+  const demo = useSession(() => isDemoSession());
   const categories = useCategories();
   const { online, streaming, position, error, notificationsOff, background } = usePresenceStore();
   const radius = me.data?.serviceRadiusKm ?? 10;
@@ -25,6 +27,16 @@ export default function RadarScreen() {
 
   return (
     <Screen>
+      {demo ? (
+        <Card style={{ borderColor: palette.inkMuted }}>
+          <Badge label="MODO DEMO" />
+          <Text variant="caption" muted>
+            Sin backend: datos ficticios y alertas lanzadas desde «Diagnóstico de latencia».
+          </Text>
+          <Button tone="neutral" variant="outline" label="Salir del modo demo" onPress={() => void goOffline().then(session.signOut)} />
+        </Card>
+      ) : null}
+
       {needsKyc ? (
         <Card style={{ borderColor: palette.provider }}>
           <Text variant="heading">Verifica tu identidad para recibir ofertas</Text>

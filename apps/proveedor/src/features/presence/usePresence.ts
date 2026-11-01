@@ -1,8 +1,9 @@
 import { useEffect, useRef } from 'react';
 import * as Location from 'expo-location';
 import { create } from 'zustand';
+import { isApiError } from '@chapus/api';
 import { socketErrorData, type GeoPoint } from '@chapus/core';
-import { api, offersSocket, session } from '@/lib/api';
+import { api, isDemoSession, offersSocket, session } from '@/lib/api';
 import { getNativePushToken } from '@/features/alerts/notifications';
 import {
   ensureBackgroundLocation,
@@ -26,6 +27,8 @@ interface PresenceState {
   notificationsOff: boolean;
   /** Seguimiento de ubicación en segundo plano activo (servicio en primer plano en Android). */
   background: boolean;
+  /** Causa del último heartbeat fallido, para el panel de diagnóstico. */
+  heartbeatError: string | null;
 }
 
 export const usePresenceStore = create<PresenceState>(() => ({
@@ -35,6 +38,7 @@ export const usePresenceStore = create<PresenceState>(() => ({
   error: null,
   notificationsOff: false,
   background: false,
+  heartbeatError: null,
 }));
 
 let fcmToken: string | undefined;
@@ -43,9 +47,13 @@ let retriedAuth = false;
 const beat = async (at: GeoPoint, isOnline: boolean) => {
   try {
     await api.heartbeat(at, isOnline, fcmToken);
-    if (usePresenceStore.getState().error === 'HEARTBEAT_FAILED') usePresenceStore.setState({ error: null });
-  } catch {
-    usePresenceStore.setState({ error: 'HEARTBEAT_FAILED' });
+    if (usePresenceStore.getState().error === 'HEARTBEAT_FAILED') {
+      usePresenceStore.setState({ error: null, heartbeatError: null });
+    }
+  } catch (e) {
+    const detail = isApiError(e) ? `HTTP ${e.status} ${e.errorCode ?? ''}`.trim() : String(e);
+    console.warn('[heartbeat] fallo:', detail);
+    usePresenceStore.setState({ error: 'HEARTBEAT_FAILED', heartbeatError: detail });
   }
 };
 
@@ -75,13 +83,15 @@ export async function goOnline() {
   const { coords } = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
   const at = { lat: coords.latitude, lng: coords.longitude };
   usePresenceStore.setState({ position: at, online: true, error: null, notificationsOff: !notifications });
-  offersSocket.connect();
+  // En demo no hay servidor de sockets: las alertas llegan desde el panel de diagnóstico.
+  if (isDemoSession()) usePresenceStore.setState({ streaming: true });
+  else offersSocket.connect();
   await beat(at, true);
 }
 
 export async function goOffline() {
   const { position } = usePresenceStore.getState();
-  usePresenceStore.setState({ online: false, background: false });
+  usePresenceStore.setState({ online: false, background: false, ...(isDemoSession() && { streaming: false }) });
   offersSocket.disconnect();
   await stopBackgroundLocation().catch(() => undefined);
   if (position) await beat(position, false);
